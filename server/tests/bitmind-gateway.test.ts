@@ -522,3 +522,54 @@ describe("follow-up findings", () => {
     expect(gateway.activeRuns()).toBe(0);
   });
 });
+
+describe("cancellation and the slot's owner", () => {
+  test("a cancelled relay does not release the retry that replaced it", async () => {
+    let calls = 0;
+    const hanging: typeof fetch = () => {
+      calls += 1;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("data: {}\n\n"));
+              // Never closes: only the consumer or the gateway ends this.
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    };
+    const gateway = createBitmindGateway(config(), hanging);
+    const first = await gateway.fetch(
+      runRequest(runInput(), { "idempotency-key": "run-1:1" }),
+    );
+    expect(first.status).toBe(200);
+    expect(gateway.activeRuns()).toBe(1);
+
+    // BitMind hangs up and immediately retries the same attempt. The cancelled
+    // relay ends through several paths (abort listener, stream cancel, the pending
+    // read resolving); the retry is admitted in the middle of them, and none of
+    // those late endings may take the retry's slot with them.
+    const cancelling = first.body?.cancel(new Error("BitMind hung up"));
+    const retry = await gateway.fetch(
+      runRequest(runInput(), { "idempotency-key": "run-1:1" }),
+    );
+    expect(retry.status).toBe(200);
+    expect(gateway.activeRuns()).toBe(1);
+    await cancelling;
+    expect(gateway.activeRuns()).toBe(1);
+
+    // The retry is streaming, so the idempotency refusal must still hold and the
+    // backend must not be asked a third time.
+    const third = await gateway.fetch(
+      runRequest(runInput(), { "idempotency-key": "run-1:1" }),
+    );
+    expect(third.status).toBe(409);
+    expect(gateway.activeRuns()).toBe(1);
+    expect(calls).toBe(2);
+
+    await retry.body?.cancel(new Error("done"));
+    expect(gateway.activeRuns()).toBe(0);
+  });
+});

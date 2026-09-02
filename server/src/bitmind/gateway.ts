@@ -171,9 +171,22 @@ export function createBitmindGateway(
     const timeout = setTimeout(() => {
       controller.abort(new Error("run relay timed out"));
     }, config.runTimeoutMs);
+    /**
+     * Give the slot back — but only if this relay still holds it.
+     *
+     * A cancelled relay ends through several paths at once (the abort listener, the
+     * stream's `cancel()`, and the pending `reader.read()` resolving), and a same-key
+     * retry can legitimately be admitted between two of them. An unconditional delete
+     * would then evict the *new* relay's entry while its stream is live, taking both
+     * the concurrency accounting and the 409 double-start refusal with it. Ownership
+     * is the guard: whoever is in the map is the only one who can leave it, which also
+     * makes every one of those endings safe to run more than once.
+     */
     const release = () => {
       clearTimeout(timeout);
-      active.delete(key);
+      if (active.get(key) === controller) {
+        active.delete(key);
+      }
     };
     request.signal.addEventListener("abort", () => {
       controller.abort(request.signal.reason as Error | undefined);
