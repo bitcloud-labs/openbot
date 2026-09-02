@@ -1,5 +1,4 @@
-import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
-import { EventEncoder } from "@ag-ui/encoder";
+import type { RunAgentInput } from "@ag-ui/core";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { type AIMessage, ToolMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
@@ -14,7 +13,8 @@ import { serve } from "bun";
 import { hasManagedAgentToken } from "../../shared/agent-authorisation";
 import { toLangChainMessages } from "./history";
 import { readReasoningEffort } from "./model-options";
-import { streamRun } from "./stream";
+import { respondWithRun } from "./respond";
+import { callDeploymentTool } from "./tools";
 
 /**
  * The same Bot, on a framework.
@@ -227,51 +227,11 @@ function buildModel() {
  * Not the vendor: this deployment. A Bot that called an MCP server directly would be a Bot that
  * walked around the grant, the policy and the audit row, and those are the product. So the loop runs
  * here, in this process, and every call it makes goes back through the deployment that granted it.
+ * The call itself lives in `tools.ts`, where a test can cancel it mid-flight.
  */
 const TOOL_URL =
   process.env.OPENBOT_TOOL_URL ?? "http://localhost:3001/api/agent-tools/call";
 const TOOL_TOKEN = process.env.AGENT_TOOL_TOKEN ?? "";
-
-async function callTool(
-  run: string,
-  name: string,
-  args: Record<string, unknown>,
-): Promise<string> {
-  if (!TOOL_TOKEN) {
-    return "Refused. This Bot has no credential for calling tools back through its deployment.";
-  }
-  if (!run) {
-    /*
-     * No statement from the deployment about whose run this is, so there is nothing to act on behalf
-     * of. Reported as a result rather than thrown: the run continues and says what it could not do.
-     */
-    return "Refused. This run carried no signed statement of which Bot and person it is for.";
-  }
-  try {
-    const response = await fetch(TOOL_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-openbot-agent-token": TOOL_TOKEN,
-      },
-      /*
-       * The deployment's own statement, handed straight back.
-       *
-       * The Bot and the actor used to be sent from here, which meant this process asserted who it was
-       * acting for. It is not in a position to know, and anything holding the token could claim
-       * anything, so the deployment says it and this only carries the note.
-       */
-      body: JSON.stringify({ name, args, run }),
-    });
-    const body = (await response.json()) as { text?: string };
-    return body.text ?? "The tool returned nothing.";
-  } catch (error) {
-    // Reported to the model as a result rather than thrown: the run continues and says what broke.
-    return `That tool could not be called: ${
-      error instanceof Error ? error.message : "unknown error"
-    }`;
-  }
-}
 
 /**
  * The deployment's signed statement of what this run is.
@@ -330,97 +290,81 @@ function buildGraph(input: RunAgentInput) {
   const bound = tools.length > 0 ? model.bindTools(tools) : model;
   const ours = deploymentToolsOf(input);
 
-  return new StateGraph(MessagesAnnotation)
-    .addNode("answer", async (state) => ({
-      messages: [await bound.invoke(state.messages)],
-    }))
-    .addNode("tools", async (state) => {
-      const last = state.messages.at(-1) as AIMessage;
-      const results = await Promise.all(
+  return (
+    new StateGraph(MessagesAnnotation)
+      // The node config carries the run's signal (streamEvents propagates it), so a
+      // cancelled run stops the model invocation and any tool call in flight — not
+      // just the reading of the stream.
+      .addNode("answer", async (state, nodeConfig) => ({
+        messages: [await bound.invoke(state.messages, nodeConfig)],
+      }))
+      .addNode("tools", async (state, nodeConfig) => {
+        const last = state.messages.at(-1) as AIMessage;
+        const results = await Promise.all(
+          /*
+           * Only this deployment's own tools. A component is drawn by the surface, and a decision is
+           * answered there by a person, so neither is executed here and neither gets a result invented
+           * here. The run ends instead, and the surface starts the next one carrying what it produced.
+           */
+          (last.tool_calls ?? [])
+            .filter((call) => ours.has(call.name))
+            .map(async (call) => {
+              const text = await callDeploymentTool(
+                { url: TOOL_URL, token: TOOL_TOKEN },
+                run,
+                call.name,
+                (call.args ?? {}) as Record<string, unknown>,
+                nodeConfig?.signal,
+              );
+              return new ToolMessage({
+                content: text,
+                tool_call_id: call.id ?? call.name,
+                name: call.name,
+              });
+            }),
+        );
+        return { messages: results };
+      })
+      .addEdge(START, "answer")
+      .addConditionalEdges("answer", (state) => {
+        const last = state.messages.at(-1) as AIMessage | undefined;
+        const calls = last?.tool_calls ?? [];
+        if (calls.length === 0) return END;
         /*
-         * Only this deployment's own tools. A component is drawn by the surface, and a decision is
-         * answered there by a person, so neither is executed here and neither gets a result invented
-         * here. The run ends instead, and the surface starts the next one carrying what it produced.
+         * A call the surface owns ends the run.
+         *
+         * This is how a tool that lives in the browser is supposed to work: the Bot asks for it, the
+         * run finishes, the surface draws it or puts the question to a person, and the surface begins
+         * the next run with the answer in hand. Running the loop through it here instead invents a
+         * result: the Bot apologises for a chart the person is looking at, and an approval card that
+         * has already been answered on its behalf sits waiting for a click that can never land.
+         *
+         * A turn that asks for both kinds at once ends too, and the model asks again for what it still
+         * has no answer to. That is the rarer case and the safe way round: the alternative runs a
+         * governed tool whose result nobody is waiting for.
          */
-        (last.tool_calls ?? [])
-          .filter((call) => ours.has(call.name))
-          .map(async (call) => {
-            const text = await callTool(
-              run,
-              call.name,
-              (call.args ?? {}) as Record<string, unknown>,
-            );
-            return new ToolMessage({
-              content: text,
-              tool_call_id: call.id ?? call.name,
-              name: call.name,
-            });
-          }),
-      );
-      return { messages: results };
-    })
-    .addEdge(START, "answer")
-    .addConditionalEdges("answer", (state) => {
-      const last = state.messages.at(-1) as AIMessage | undefined;
-      const calls = last?.tool_calls ?? [];
-      if (calls.length === 0) return END;
-      /*
-       * A call the surface owns ends the run.
-       *
-       * This is how a tool that lives in the browser is supposed to work: the Bot asks for it, the
-       * run finishes, the surface draws it or puts the question to a person, and the surface begins
-       * the next run with the answer in hand. Running the loop through it here instead invents a
-       * result: the Bot apologises for a chart the person is looking at, and an approval card that
-       * has already been answered on its behalf sits waiting for a click that can never land.
-       *
-       * A turn that asks for both kinds at once ends too, and the model asks again for what it still
-       * has no answer to. That is the rarer case and the safe way round: the alternative runs a
-       * governed tool whose result nobody is waiting for.
-       */
-      if (callsTheSurface(calls, ours)) return END;
-      return "tools";
-    })
-    .addEdge("tools", "answer")
-    .compile();
+        if (callsTheSurface(calls, ours)) return END;
+        return "tools";
+      })
+      .addEdge("tools", "answer")
+      .compile()
+  );
 }
 
-async function runAgent(input: RunAgentInput): Promise<Response> {
-  const encoder = new EventEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const utf8 = new TextEncoder();
-      const send = (event: BaseEvent) =>
-        controller.enqueue(utf8.encode(encoder.encodeSSE(event)));
-
-      send({
-        type: "RUN_STARTED",
-        threadId: input.threadId,
-        runId: input.runId,
-      } as BaseEvent);
-
-      // The graph is built and its event stream opened inside `streamRun`, so a failure doing either
-      // is reported as RUN_ERROR through the same path as a failure mid-stream.
-      await streamRun(
-        async () =>
-          buildGraph(input).streamEvents(
-            { messages: toLangChainMessages(input) },
-            { version: "v2" },
-          ),
-        input,
-        send,
-      );
-
-      controller.close();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "content-type": encoder.getContentType(),
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
+function runAgent(input: RunAgentInput, clientSignal?: AbortSignal): Response {
+  // The graph is built and its event stream opened inside `streamRun`, so a failure
+  // doing either is reported as RUN_ERROR through the same path as a failure
+  // mid-stream. The signal reaches the framework itself: an aborted run stops the
+  // model call, not just the reading of it.
+  return respondWithRun(
+    input,
+    async (signal) =>
+      buildGraph(input).streamEvents(
+        { messages: toLangChainMessages(input) },
+        { version: "v2", signal },
+      ),
+    clientSignal,
+  );
 }
 
 serve({
@@ -444,7 +388,7 @@ serve({
         return Response.json({ error: "Unauthorized." }, { status: 401 });
       }
       const input = (await request.json()) as RunAgentInput;
-      return runAgent(input);
+      return runAgent(input, request.signal);
     }
 
     return Response.json({ error: "Not found." }, { status: 404 });
