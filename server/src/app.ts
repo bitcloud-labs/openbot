@@ -1046,17 +1046,15 @@ export function createApp(
     );
   }
 
-  if (threadIdentity) {
+  if (threadIdentity && config.runtime.mode === "intelligence") {
     app.route(
       "/api/threads",
       createThreadRoutes(
         threadIdentity,
         requireUser,
-        // config.ts refuses to boot without the full Intelligence contract (see copilot.ts's
-        // header comment), so `config.runtime.intelligence` is never missing here. Built from it
-        // rather than assumed, though: this is the one place besides the runtime mount itself that
-        // needs to reach Intelligence, and it should keep working unmodified if that guarantee ever
-        // loosens and a deployment can legitimately have no reader to build.
+        // The guarantee this comment once leaned on has loosened: a standalone deployment
+        // has no Intelligence to ask about a thread, so it has no reader to build and the
+        // routes stay unmounted — threads 404 by design there, like the chat runtime.
         createThreadReader(
           createIntelligenceClient(config.runtime.intelligence),
         ),

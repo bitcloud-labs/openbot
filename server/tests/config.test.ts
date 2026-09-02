@@ -89,9 +89,10 @@ describe("deployment configuration", () => {
     expect(config.auth).toBeUndefined();
   });
 
-  // The product does not have a mode without Intelligence, so each of these is a refusal to boot
-  // rather than a degraded capability. Named individually because a deployment that sets three of
-  // four is the likeliest real mistake, and the message has to say which one is missing.
+  // A partial set is still a refusal to boot rather than a degraded capability: three of four
+  // reads as somebody configuring Intelligence and getting it wrong, not as a choice. Named
+  // individually because that is the likeliest real mistake, and the message has to say which
+  // one is missing — and now also has to say that unsetting all four is the other valid shape.
   test.each([
     "INTELLIGENCE_API_URL",
     "INTELLIGENCE_GATEWAY_WS_URL",
@@ -103,20 +104,29 @@ describe("deployment configuration", () => {
     };
     delete environment[name];
 
-    expect(() => loadConfig(environment)).toThrow(
-      `CopilotKit Intelligence is required and is not configured. Missing: ${name}`,
-    );
+    const attempt = () => loadConfig(environment);
+    expect(attempt).toThrow(`Missing: ${name}`);
+    expect(attempt).toThrow("unset all four to run standalone");
   });
 
-  test("refuses to start when Intelligence is absent entirely, rather than degrading", () => {
-    expect(() =>
-      loadConfig({
-        DATABASE_URL: baseEnvironment.DATABASE_URL,
-        KEY_ENCRYPTION_KEY: baseEnvironment.KEY_ENCRYPTION_KEY,
-        MANAGED_AGENT_AG_UI_URL: baseEnvironment.MANAGED_AGENT_AG_UI_URL,
-        MANAGED_AGENT_TOKEN: baseEnvironment.MANAGED_AGENT_TOKEN,
-      }),
-    ).toThrow("CopilotKit Intelligence is required and is not configured");
+  test("boots standalone when Intelligence is absent entirely", () => {
+    // The reversal of the old "refuses rather than degrading" decision, made deliberately for
+    // the BitMind execution enclave (bit-mind #20 / ADR-0002): a deployment that never meant to
+    // configure Intelligence gets a working admin surface and no chat runtime, not a refusal.
+    // Nothing is degraded silently — the mode is stated, and the chat/thread/routine surfaces
+    // are unmounted rather than mounted-and-refusing.
+    const config = loadConfig({
+      DATABASE_URL: baseEnvironment.DATABASE_URL,
+      KEY_ENCRYPTION_KEY: baseEnvironment.KEY_ENCRYPTION_KEY,
+      MANAGED_AGENT_AG_UI_URL: baseEnvironment.MANAGED_AGENT_AG_UI_URL,
+      MANAGED_AGENT_TOKEN: baseEnvironment.MANAGED_AGENT_TOKEN,
+      OPENBOT_SINGLE_USER: "true",
+    });
+
+    expect(config.runtime).toEqual({
+      mode: "standalone",
+      durableHistory: false,
+    });
   });
 
   test("rejects incomplete OAuth client configuration", () => {

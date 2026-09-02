@@ -7,11 +7,24 @@ import { singleUserEnabled } from "./auth/dev-actor";
 import type { ActionPolicy } from "./computer/policy";
 import { parseActionPolicy } from "./computer/policy-store";
 
-export type RuntimeCapabilities = {
-  mode: "intelligence";
-  durableHistory: true;
-  intelligence: IntelligenceSettings;
-};
+export type RuntimeCapabilities =
+  | {
+      mode: "intelligence";
+      durableHistory: true;
+      intelligence: IntelligenceSettings;
+    }
+  /**
+   * A deployment with no Intelligence contract at all.
+   *
+   * The admin, people, computer and plugin surfaces all work; the chat runtime, threads
+   * and routines do not mount, so those paths 404 by design rather than refusing. This
+   * is the shape the BitMind execution enclave runs in: runs arrive through the BitMind
+   * gateway and an AG-UI agent, never through the chat surface.
+   */
+  | {
+      mode: "standalone";
+      durableHistory: false;
+    };
 
 /** The Intelligence contract. Every field is required; see runtimeCapabilities. */
 export type IntelligenceSettings = {
@@ -556,11 +569,13 @@ function oktaAuth(
 }
 
 /**
- * Resolve the Intelligence contract, or refuse to start.
+ * Resolve the Intelligence contract, choose standalone, or refuse to start.
  *
  * All four values are required together. A partial set is the more dangerous shape than none at all:
- * it means somebody intended to configure Intelligence and got it wrong, so failing on the partial
- * set alone (as this did) let a completely unconfigured deployment through as if that were a choice.
+ * it means somebody intended to configure Intelligence and got it wrong, so it is still a refusal to
+ * boot that names what is missing. All four absent is different: it is a deployment that never meant
+ * to configure Intelligence, and it boots standalone — admin working, chat and threads unmounted —
+ * which is the shape the BitMind execution enclave runs.
  */
 function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
   const settings = {
@@ -579,9 +594,12 @@ function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
     .filter(([, value]) => !value)
     .map(([name]) => name);
 
+  if (missing.length === 4) {
+    return { mode: "standalone", durableHistory: false };
+  }
   if (missing.length > 0) {
     throw new Error(
-      `CopilotKit Intelligence is required and is not configured. Missing: ${missing.join(", ")}`,
+      `CopilotKit Intelligence is partially configured, which reads as a mistake rather than a choice. Missing: ${missing.join(", ")}. Set all four, or unset all four to run standalone.`,
     );
   }
 

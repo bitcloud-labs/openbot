@@ -1,8 +1,4 @@
 import { randomUUID } from "node:crypto";
-import {
-  CopilotKitIntelligence,
-  IntelligenceAgentRunner,
-} from "@copilotkit/runtime/v2";
 import { serve } from "bun";
 import { eq } from "drizzle-orm";
 import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
@@ -15,7 +11,6 @@ import { createHandoffRunner } from "./agents/handoff-runner";
 import { handoffTool } from "./agents/handoff-tool";
 import { createAgentProfileStore } from "./agents/profile-store";
 import type { AgentActor } from "./agents/profile-types";
-import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
 import { startRetentionSweeps } from "./audit-retention";
@@ -47,13 +42,7 @@ import {
 } from "./computer/provider";
 import { createSnapshotStore } from "./computer/snapshot-store";
 import { loadConfig } from "./config";
-import {
-  type IdentifyActor,
-  type IdentifyUser,
-  mountCopilotRuntime,
-  resolveRuntimeAgents,
-  type ToolSelection,
-} from "./copilot";
+import type { IdentifyActor, IdentifyUser, ToolSelection } from "./copilot";
 import {
   createCredentialAdminService,
   createCredentialStore,
@@ -67,7 +56,6 @@ import { useRoutineTools } from "./plugins/builtin-routines";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
-import { createTurnRunner } from "./routines/run-turn";
 import { createRoutineRunner } from "./routines/runner";
 import { createRoutineStore } from "./routines/store";
 import { createIntentRouter } from "./routing/classify";
@@ -197,11 +185,6 @@ const channelActivityListener = await startChannelActivityListener(
   channelEvents,
 );
 const roleRepository = createRoleRepository(database);
-const loadAgentsForActor = createRuntimeAgentLoader(
-  database,
-  agentVault,
-  config.managedAgent,
-);
 await synchronizeTenantPackage(database, tenantPackage);
 /*
  * Built before `auth`, because the deny list is consulted during sign-in and the store is what
@@ -645,48 +628,6 @@ const actorFor = async (ownerUserId: string): Promise<AgentActor> => {
  * routine row — which is the whole point of doing it here rather than adding an impersonation path to
  * a public route.
  */
-const buildAgentFor = async ({
-  ownerUserId,
-  agentId,
-}: {
-  ownerUserId: string;
-  agentId: string;
-}) => {
-  const actor = await actorFor(ownerUserId);
-  const agents = await resolveRuntimeAgents(
-    () => loadAgentsForActor(actor),
-    tenantPackage.model,
-    resolveRuntimeModelApiKey,
-    stallGuard,
-    loadToolsForActor(actor.id),
-    signRunForActor(actor.id),
-    config.computer ? COMPUTER_GUIDANCE : undefined,
-    loadVendors,
-    selectionForActor(actor.id),
-    agentFetch,
-    undefined,
-    // Only the Bot this routine names. Same reason as the hop delivery: the roster is still read in
-    // full so a Bot this owner cannot see is still absent, but the other Bots are neither built nor
-    // asked what they hold.
-    agentId,
-  );
-  const agent = agents[agentId];
-  if (!agent) {
-    /*
-     * Named, and raised rather than swallowed. The routine's Bot was deleted, or made private by
-     * somebody else, or the owner lost the role that could see it. The runner turns this into a
-     * failed run row with this sentence on it, the first failure is said once in the channel, and
-     * the fatigue rule switches the routine off after ten — which is exactly the right handling for
-     * a routine pointed at something that is not coming back.
-     */
-    const error = new Error(
-      `That Bot is no longer registered, so this routine has nothing to run: ${agentId}.`,
-    );
-    error.name = "RoutineBotNotRegistered";
-    throw error;
-  }
-  return agent;
-};
 
 /*
  * The pair a headless turn is driven through, built ONCE.
@@ -703,130 +644,219 @@ const buildAgentFor = async ({
  * connection, but its `threads` map is per instance, and a runner per turn would fragment the
  * already-running check that keeps two turns off one thread. See `routines/run-turn.ts`.
  */
-const routineIntelligence = new CopilotKitIntelligence({
-  apiUrl: config.runtime.intelligence.apiUrl,
-  wsUrl: config.runtime.intelligence.gatewayWsUrl,
-  apiKey: config.runtime.intelligence.apiKey,
-});
-const routineAgentRunner = new IntelligenceAgentRunner({
-  url: routineIntelligence.ɵgetRunnerWsUrl(),
-  authToken: routineIntelligence.ɵgetRunnerAuthToken(),
-});
-
-const routineRunner = createRoutineRunner({
-  routineStore,
-  channelStore,
-  runTurn: createTurnRunner({
-    intelligence: routineIntelligence,
-    runner: routineAgentRunner,
-    buildAgentFor,
-  }),
-});
-
-/**
- * The runtime, and the two things beside it a hop needs.
+/*
+ * The Intelligence-bound wiring, built ONCE — and only in intelligence mode.
  *
- * `agentFor` builds the addressed Bot exactly the way a person's run builds it, and `history` reads
- * the conversation through the same client. Taken from here rather than assembled again, because a
- * Bot built by parallel wiring drifts the first time one of these arguments changes, and the drift is
- * invisible: it runs, and quietly holds different tools or a different role from the one the person
- * is talking to.
+ * This is the guard the old single-mode comment promised: standalone leaves the
+ * routine runner off `createApp` entirely and mounts no chat runtime.
+ *
+ * WHY THE IMPORTS ARE DYNAMIC. Standalone must not evaluate the runtime's import
+ * graph at all, and that is load-bearing rather than tidy: the graph reaches
+ * `@modelcontextprotocol/sdk`'s CommonJS SSE client, whose `require()` of the
+ * ESM-only `eventsource` package can crash Bun at import time depending on graph
+ * shape. A standalone boot has no reason to gamble on that; an intelligence boot
+ * loads exactly what it always loaded, just at this line instead of the top.
+ *
+ * One headless pair for the process, reused across firings: the runner opens a
+ * socket per run and holds no idle connection, but its `threads` map is per
+ * instance, and a runner per turn would fragment the already-running check that
+ * keeps two turns off one thread. See `routines/run-turn.ts`.
  */
-const copilotRuntime = mountCopilotRuntime(
-  config,
-  tenantPackage.model,
-  loadAgentsForActor,
-  resolveRuntimeModelApiKey,
-  identifyUser,
-  identifyActor,
-  stallGuard,
-  loadToolsForActor,
-  signRunForActor,
-  undefined,
-  loadVendors,
-  selectionForActor,
-  agentFetch,
-  /*
-   * What a Bot may reach past itself for: another Bot, and a person. Made per run and per person.
-   *
-   * Per person because which Bots may be reached is decided against the roster that person can
-   * see: a Bot must never be able to address one they cannot, or this becomes a way around agent
-   * visibility. Per run because the caps need to know how deep the chain already is and where an
-   * answer belongs, and both of those are the deployment's own statement about the run rather than
-   * anything the model can edit.
-   */
-  (actorId) => async (botId, input) => {
-    const from = readRunAssertion(
-      (input.forwardedProps as { openbotRun?: unknown } | undefined)
-        ?.openbotRun,
-      config.keyEncryptionKey,
-    );
-    const run = {
-      botId,
-      actorId,
-      runId: input.runId,
-      threadId: input.threadId,
-      depth: from?.depth ?? 0,
-    };
-    /*
-     * The caps are checked BEFORE the grants query, not inside the tool that would discard it.
-     *
-     * `handoffTool` short-circuits on all three of these, but only after being handed a
-     * `hasSomebodyToAsk` that costs a query. So a deployment which switched the capability off
-     * still paid one grants read per run of every Bot, for a tool it was never going to be offered,
-     * and a run already at the cap paid it again.
-     */
-    const couldHandOn =
-      config.handoff.maxDepth > 0 &&
-      config.handoff.maxPerRun > 0 &&
-      run.depth < config.handoff.maxDepth;
+const intelligence =
+  config.runtime.mode === "intelligence"
+    ? await (async (runtime) => {
+        const [
+          { CopilotKitIntelligence, IntelligenceAgentRunner },
+          { mountCopilotRuntime, resolveRuntimeAgents },
+          { createRuntimeAgentLoader },
+          { createTurnRunner },
+        ] = await Promise.all([
+          import("@copilotkit/runtime/v2"),
+          import("./copilot"),
+          import("./agents/runtime-agents"),
+          import("./routines/run-turn"),
+        ]);
 
-    const passing = couldHandOn
-      ? handoffTool({
-          desk: handoffDesk,
+        const loadAgentsForActor = createRuntimeAgentLoader(
+          database,
+          agentVault,
+          config.managedAgent,
+        );
+
+        const buildAgentFor = async ({
+          ownerUserId,
+          agentId,
+        }: {
+          ownerUserId: string;
+          agentId: string;
+        }) => {
+          const actor = await actorFor(ownerUserId);
+          const agents = await resolveRuntimeAgents(
+            () => loadAgentsForActor(actor),
+            tenantPackage.model,
+            resolveRuntimeModelApiKey,
+            stallGuard,
+            loadToolsForActor(actor.id),
+            signRunForActor(actor.id),
+            config.computer ? COMPUTER_GUIDANCE : undefined,
+            loadVendors,
+            selectionForActor(actor.id),
+            agentFetch,
+            undefined,
+            // Only the Bot this routine names. Same reason as the hop delivery: the roster is still read in
+            // full so a Bot this owner cannot see is still absent, but the other Bots are neither built nor
+            // asked what they hold.
+            agentId,
+          );
+          const agent = agents[agentId];
+          if (!agent) {
+            /*
+             * Named, and raised rather than swallowed. The routine's Bot was deleted, or made private by
+             * somebody else, or the owner lost the role that could see it. The runner turns this into a
+             * failed run row with this sentence on it, the first failure is said once in the channel, and
+             * the fatigue rule switches the routine off after ten — which is exactly the right handling for
+             * a routine pointed at something that is not coming back.
+             */
+            const error = new Error(
+              `That Bot is no longer registered, so this routine has nothing to run: ${agentId}.`,
+            );
+            error.name = "RoutineBotNotRegistered";
+            throw error;
+          }
+          return agent;
+        };
+
+        const routineIntelligence = new CopilotKitIntelligence({
+          apiUrl: runtime.intelligence.apiUrl,
+          wsUrl: runtime.intelligence.gatewayWsUrl,
+          apiKey: runtime.intelligence.apiKey,
+        });
+        const routineAgentRunner = new IntelligenceAgentRunner({
+          url: routineIntelligence.ɵgetRunnerWsUrl(),
+          authToken: routineIntelligence.ɵgetRunnerAuthToken(),
+        });
+        const routineRunner = createRoutineRunner({
+          routineStore,
+          channelStore,
+          runTurn: createTurnRunner({
+            intelligence: routineIntelligence,
+            runner: routineAgentRunner,
+            buildAgentFor,
+          }),
+        });
+
+        const copilotRuntime = mountCopilotRuntime(
+          config,
+          tenantPackage.model,
+          loadAgentsForActor,
+          resolveRuntimeModelApiKey,
+          identifyUser,
+          identifyActor,
+          stallGuard,
+          loadToolsForActor,
+          signRunForActor,
+          undefined,
+          loadVendors,
+          selectionForActor,
+          agentFetch,
           /*
-           * How deep this run already is comes from the assertion the deployment signed when it handed
-           * this work on. A run a person started carries none, and none means zero.
+           * What a Bot may reach past itself for: another Bot, and a person. Made per run and per person.
            *
-           * NOT `from.botId`. The assertion proves what this run is, and the Bot is whichever one the
-           * runtime is building right now: on a hop those agree, and taking the id from the signed
-           * value rather than from the build would let a stale assertion aim the next hop at the
-           * wrong Bot's grants.
+           * Per person because which Bots may be reached is decided against the roster that person can
+           * see: a Bot must never be able to address one they cannot, or this becomes a way around agent
+           * visibility. Per run because the caps need to know how deep the chain already is and where an
+           * answer belongs, and both of those are the deployment's own statement about the run rather than
+           * anything the model can edit.
            */
-          from: run,
-          // Read now rather than at boot, so a grant made a minute ago counts and one revoked a
-          // minute ago stops counting.
-          hasSomebodyToAsk:
-            (
-              await pluginStore
-                .botsReachableFrom(botId)
-                .catch(() => [] as string[])
-            ).length > 0,
-          maxDepth: config.handoff.maxDepth,
-          maxPerRun: config.handoff.maxPerRun,
-        })
-      : null;
-    /*
-     * The way to stop and ask is offered whether or not there is a Bot to hand to.
-     *
-     * It is the cheaper of the two and the one a Bot should reach for first: asking the person who
-     * is already in the conversation spends nothing and cannot be aimed anywhere they cannot see.
-     * A deployment that offered only the expensive exit would push every unanswerable question
-     * sideways into another run.
-     */
-    const asking = escalationTool({
-      from: run,
-      route: askTheirOwnPerson,
-      auditStore: bootAuditStore,
-    });
-    return passing ? [passing, asking] : [asking];
-  },
-  // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
-  // thread, and a scratch thread maps to no channel and signals nowhere.
-  (input) => {
-    void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
-  },
-);
+          (actorId) => async (botId, input) => {
+            const from = readRunAssertion(
+              (input.forwardedProps as { openbotRun?: unknown } | undefined)
+                ?.openbotRun,
+              config.keyEncryptionKey,
+            );
+            const run = {
+              botId,
+              actorId,
+              runId: input.runId,
+              threadId: input.threadId,
+              depth: from?.depth ?? 0,
+            };
+            /*
+             * The caps are checked BEFORE the grants query, not inside the tool that would discard it.
+             *
+             * `handoffTool` short-circuits on all three of these, but only after being handed a
+             * `hasSomebodyToAsk` that costs a query. So a deployment which switched the capability off
+             * still paid one grants read per run of every Bot, for a tool it was never going to be offered,
+             * and a run already at the cap paid it again.
+             */
+            const couldHandOn =
+              config.handoff.maxDepth > 0 &&
+              config.handoff.maxPerRun > 0 &&
+              run.depth < config.handoff.maxDepth;
+
+            const passing = couldHandOn
+              ? handoffTool({
+                  desk: handoffDesk,
+                  /*
+                   * How deep this run already is comes from the assertion the deployment signed when it handed
+                   * this work on. A run a person started carries none, and none means zero.
+                   *
+                   * NOT `from.botId`. The assertion proves what this run is, and the Bot is whichever one the
+                   * runtime is building right now: on a hop those agree, and taking the id from the signed
+                   * value rather than from the build would let a stale assertion aim the next hop at the
+                   * wrong Bot's grants.
+                   */
+                  from: run,
+                  // Read now rather than at boot, so a grant made a minute ago counts and one revoked a
+                  // minute ago stops counting.
+                  hasSomebodyToAsk:
+                    (
+                      await pluginStore
+                        .botsReachableFrom(botId)
+                        .catch(() => [] as string[])
+                    ).length > 0,
+                  maxDepth: config.handoff.maxDepth,
+                  maxPerRun: config.handoff.maxPerRun,
+                })
+              : null;
+            /*
+             * The way to stop and ask is offered whether or not there is a Bot to hand to.
+             *
+             * It is the cheaper of the two and the one a Bot should reach for first: asking the person who
+             * is already in the conversation spends nothing and cannot be aimed anywhere they cannot see.
+             * A deployment that offered only the expensive exit would push every unanswerable question
+             * sideways into another run.
+             */
+            const asking = escalationTool({
+              from: run,
+              route: askTheirOwnPerson,
+              auditStore: bootAuditStore,
+            });
+            return passing ? [passing, asking] : [asking];
+          },
+          // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
+          // thread, and a scratch thread maps to no channel and signals nowhere.
+          (input) => {
+            void channelStore
+              .signalBusy(input.threadId, input.busy)
+              .catch(() => {});
+          },
+        );
+
+        return {
+          copilotRuntime,
+          routineRunner,
+          // The class itself, for the handoff delivery below: it must construct its
+          // runner from the runtime's own connection, and only this branch loaded it.
+          AgentRunner: IntelligenceAgentRunner,
+        };
+      })(config.runtime)
+    : // Standalone: no chat runtime to mount. createApp leaves its routes off, so
+      // /api/copilotkit 404s by design rather than mounting a door that refuses.
+      undefined;
+
+const copilotRuntime = intelligence?.copilotRuntime;
+const routineRunner = intelligence?.routineRunner;
 
 /**
  * Delivering hops, on every replica.
@@ -854,7 +884,25 @@ const copilotRuntime = mountCopilotRuntime(
  */
 let workOfferedListener: WorkOfferedListener | undefined;
 
-if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
+if (
+  config.handoff.maxDepth > 0 &&
+  config.handoff.maxPerRun > 0 &&
+  !intelligence
+) {
+  // Configured on, but there is no runtime to deliver a hop through. Said out loud
+  // rather than silently ignored: the deployment asked for a capability standalone
+  // cannot provide.
+  console.warn(
+    "[handoff] handing work between Bots is configured on, but a standalone deployment has no runtime to deliver through; hops stay off.",
+  );
+}
+
+if (
+  config.handoff.maxDepth > 0 &&
+  config.handoff.maxPerRun > 0 &&
+  intelligence &&
+  copilotRuntime
+) {
   const runner = createHandoffRunner({
     queue: createWorkQueue(database),
     owner: `handoff/${process.env.HOSTNAME ?? randomUUID().slice(0, 8)}`,
@@ -928,7 +976,7 @@ if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
       // The same address and the same token the runtime uses. Assembling either from configuration
       // produced a runner every join was refused for, because the thread's active run is a lock the
       // platform issues rather than something an API key can claim.
-      runner: new IntelligenceAgentRunner(
+      runner: new intelligence.AgentRunner(
         copilotRuntime.runnerConnection(),
       ) as never,
     }),
@@ -1043,8 +1091,9 @@ const app = createApp(
   ),
   createPackageStatusReader(database),
   // The runtime call: the model, per-actor agent loading, and the two identity
-  // functions are how a run is attributed to a person.
-  copilotRuntime.handler,
+  // functions are how a run is attributed to a person. Absent on a standalone
+  // deployment, which leaves the chat surface unmounted.
+  copilotRuntime?.handler,
   // The only path to an acting call.
   computerGateway,
   policyStore,
