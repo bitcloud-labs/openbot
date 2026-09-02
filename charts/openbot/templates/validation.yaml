@@ -68,14 +68,40 @@ This template renders nothing.
 {{- end }}
 
 {{- /*
-  Intelligence, which is not optional.
+  The runtime, chosen explicitly.
 
-  All four values are required together and the server refuses to start on a partial set, so the
-  same rule is applied here: caught at install with the values named, rather than in a crash loop
-  whose message is in a log nobody has opened.
+  "intelligence" requires the full contract — all four values together, the server refuses a
+  partial set, so the same rule is applied here: caught at install with the values named, rather
+  than in a crash loop whose message is in a log nobody has opened. "standalone" requires the
+  opposite: Intelligence values present alongside it are the contradiction the server also
+  refuses, caught here first.
 */}}
+{{- $mode := .Values.config.runtimeMode | default "intelligence" }}
+{{- if and (ne $mode "intelligence") (ne $mode "standalone") }}
+{{- fail (printf "config.runtimeMode=%s is not a mode. Use intelligence or standalone." $mode) }}
+{{- end }}
+{{- if eq $mode "standalone" }}
+{{- if or .Values.config.intelligence.apiUrl .Values.config.intelligence.gatewayWsUrl .Values.secrets.intelligenceApiKey .Values.secrets.licenseToken }}
+{{- fail "config.runtimeMode=standalone contradicts the Intelligence values that are set. Unset config.intelligence.* and secrets.intelligenceApiKey/licenseToken, or drop the mode." }}
+{{- end }}
+{{- if (.Values.routines).enabled }}
+{{- fail "routines.enabled needs the intelligence runtime: a standalone server unmounts the routine surface, and a CronJob whose every dispatch is a 404 is worse than none. Disable routines, or drop config.runtimeMode=standalone." }}
+{{- end }}
+{{- /*
+  The escape hatch must not smuggle the mode back in. `config.extraEnv` renders after the
+  generated variables and the last duplicate name wins — deliberately, for every variable
+  except the ones that define which runtime this pod IS. An extraEnv entry naming one of
+  those would boot a pod in a mode this validation never saw.
+*/}}
+{{- range .Values.config.extraEnv }}
+{{- if has .name (list "OPENBOT_RUNTIME_MODE" "INTELLIGENCE_API_URL" "INTELLIGENCE_GATEWAY_WS_URL" "INTELLIGENCE_API_KEY" "COPILOTKIT_LICENSE_TOKEN") }}
+{{- fail (printf "config.extraEnv must not set %s in standalone: it would override the mode this chart validated. Configure the runtime through config.runtimeMode and config.intelligence.* instead." .name) }}
+{{- end }}
+{{- end }}
+{{- else }}
 {{- if or (not .Values.config.intelligence.apiUrl) (not .Values.config.intelligence.gatewayWsUrl) }}
-{{- fail "OpenBot requires CopilotKit Intelligence. Set config.intelligence.apiUrl and config.intelligence.gatewayWsUrl, and the matching secrets.intelligenceApiKey and secrets.licenseToken." }}
+{{- fail "The intelligence runtime requires CopilotKit Intelligence. Set config.intelligence.apiUrl and config.intelligence.gatewayWsUrl, and the matching secrets.intelligenceApiKey and secrets.licenseToken — or set config.runtimeMode=standalone." }}
+{{- end }}
 {{- end }}
 
 {{- /*

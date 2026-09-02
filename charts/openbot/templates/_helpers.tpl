@@ -202,6 +202,10 @@ and in whatever holds the release, which is not where `KEY_ENCRYPTION_KEY` belon
   value: {{ $maxDepth | quote }}
 - name: BOT_HANDOFF_MAX_PER_RUN
   value: {{ $maxPerRun | quote }}
+{{- if eq (.Values.config.runtimeMode | default "intelligence") "standalone" }}
+- name: OPENBOT_RUNTIME_MODE
+  value: "standalone"
+{{- else }}
 - name: INTELLIGENCE_API_URL
   value: {{ .Values.config.intelligence.apiUrl | quote }}
 - name: INTELLIGENCE_GATEWAY_WS_URL
@@ -216,6 +220,7 @@ and in whatever holds the release, which is not where `KEY_ENCRYPTION_KEY` belon
     secretKeyRef:
       name: {{ include "openbot.secretName" . }}
       key: license-token
+{{- end }}
 {{- with .Values.config.managedAgent.url }}
 - name: MANAGED_AGENT_AG_UI_URL
   value: {{ . | quote }}

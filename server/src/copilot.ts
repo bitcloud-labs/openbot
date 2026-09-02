@@ -1024,6 +1024,13 @@ export function mountCopilotRuntime(
    */
   onRunBusy?: (input: { threadId: string; busy: boolean }) => void,
 ) {
+  if (config.runtime.mode !== "intelligence") {
+    // The one line config.ts's old single-mode comment promised would grow a guard.
+    // A standalone deployment never calls this: the runtime is not mounted at all.
+    throw new Error(
+      "mountCopilotRuntime requires the Intelligence runtime; a standalone deployment must not mount it.",
+    );
+  }
   const { intelligence } = config.runtime;
 
   /**

@@ -1,0 +1,36 @@
+# The BitMind execution enclave's shape: no Intelligence contract at all.
+#
+# The server boots with OPENBOT_RUNTIME_MODE=standalone — admin surfaces working, chat, threads
+# and routines unmounted — so nothing here carries an Intelligence URL, key or licence, and the
+# render must produce a Secret without those keys. Routines stay off: the standalone server has
+# no runtime to hand a firing to.
+#
+# NOTE FOR CI: this target must be added to the chart job's matrix in
+# .github/workflows/ci.yml (a change that needs the workflow permission).
+config:
+  runtimeMode: standalone
+  initialAdminEmails: admin@example.com
+  auth:
+    google:
+      clientId: example.apps.googleusercontent.com
+  publicUrl: https://openbot.internal
+postgresql:
+  enabled: true
+  auth:
+    # Yours to choose, and the same value on every upgrade. Rendering example only.
+    password: "example-for-rendering-only"
+secrets:
+  # Sessions are signed with this. Rendering example only; generate one with: openssl rand -base64 32
+  betterAuthSecret: "example-for-rendering-only-at-least-32-chars"
+  # keyEncryptionKey is supplied on the command line, like every target:
+  #   --set-string secrets.keyEncryptionKey="$(openssl rand -base64 32)"
+  googleClientSecret: "example-for-rendering-only"
+  computerToken: "example-for-rendering-only"
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: openbot.internal
+      paths:
+        - path: /
+          pathType: Prefix
