@@ -569,15 +569,27 @@ function oktaAuth(
 }
 
 /**
- * Resolve the Intelligence contract, choose standalone, or refuse to start.
+ * Resolve the Intelligence contract, or the explicitly chosen standalone mode, or refuse.
  *
- * All four values are required together. A partial set is the more dangerous shape than none at all:
- * it means somebody intended to configure Intelligence and got it wrong, so it is still a refusal to
- * boot that names what is missing. All four absent is different: it is a deployment that never meant
- * to configure Intelligence, and it boots standalone — admin working, chat and threads unmounted —
- * which is the shape the BitMind execution enclave runs.
+ * All four Intelligence values are required together; any missing value is a refusal to boot that
+ * names what is absent. That includes ALL of them being absent: a Kubernetes Secret that failed to
+ * mount makes all four disappear at once, and a deployment that silently came up "healthy" with the
+ * chat runtime missing would turn a secret outage into a mystery. Standalone is therefore an
+ * explicit choice — `OPENBOT_RUNTIME_MODE=standalone` — the same shape as `OPENBOT_SINGLE_USER`:
+ * the deployment says it meant it. Chosen standalone with Intelligence values also set is refused
+ * as the contradiction it is.
  */
 function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
+  const chosen = optional(environment, "OPENBOT_RUNTIME_MODE");
+  if (
+    chosen !== undefined &&
+    chosen !== "standalone" &&
+    chosen !== "intelligence"
+  ) {
+    throw new Error(
+      `OPENBOT_RUNTIME_MODE=${chosen} is not a mode. Use standalone or intelligence, or unset it.`,
+    );
+  }
   const settings = {
     apiUrl: url(environment, "INTELLIGENCE_API_URL"),
     gatewayWsUrl: url(environment, "INTELLIGENCE_GATEWAY_WS_URL"),
@@ -594,12 +606,17 @@ function runtimeCapabilities(environment: Environment): RuntimeCapabilities {
     .filter(([, value]) => !value)
     .map(([name]) => name);
 
-  if (missing.length === 4) {
+  if (chosen === "standalone") {
+    if (missing.length < 4) {
+      throw new Error(
+        "OPENBOT_RUNTIME_MODE=standalone contradicts the Intelligence values that are set. Unset the INTELLIGENCE_* / COPILOTKIT_LICENSE_TOKEN values, or drop the mode.",
+      );
+    }
     return { mode: "standalone", durableHistory: false };
   }
   if (missing.length > 0) {
     throw new Error(
-      `CopilotKit Intelligence is partially configured, which reads as a mistake rather than a choice. Missing: ${missing.join(", ")}. Set all four, or unset all four to run standalone.`,
+      `CopilotKit Intelligence is not fully configured. Missing: ${missing.join(", ")}. Set all four, or set OPENBOT_RUNTIME_MODE=standalone to run without it.`,
     );
   }
 
@@ -879,6 +896,27 @@ export function loadConfig(
   const auth = authConfig(environment, google);
   const managedAgent = managedAgentConfig(environment);
   const workerSharedSecret = optional(environment, "WORKER_SHARED_SECRET");
+  const runtime = runtimeCapabilities(environment);
+  // Zeroed HERE, where every consumer reads it, rather than warned about where only
+  // one does: the capability endpoint, the grant surface and the delivery loop all
+  // derive "may Bots hand work off" from these caps, and a standalone deployment has
+  // no runtime to deliver a hop through. Zeroing at the source keeps every one of
+  // those answers the same. Said out loud when somebody explicitly asked for it.
+  let handoff = handoffCaps(environment);
+  if (
+    runtime.mode === "standalone" &&
+    (handoff.maxDepth > 0 || handoff.maxPerRun > 0)
+  ) {
+    if (
+      optional(environment, "BOT_HANDOFF_MAX_DEPTH") !== undefined ||
+      optional(environment, "BOT_HANDOFF_MAX_PER_RUN") !== undefined
+    ) {
+      console.warn(
+        "BOT_HANDOFF_* is set, but a standalone deployment has no runtime to deliver a hop through; handing work between Bots is off.",
+      );
+    }
+    handoff = { maxDepth: 0, maxPerRun: 0 };
+  }
 
   return {
     databaseUrl: required(environment, "DATABASE_URL"),
@@ -897,7 +935,7 @@ export function loadConfig(
     )?.replace(/\/+$/, ""),
     tenantPackageDirectory:
       optional(environment, "TENANT_PACKAGE_DIR") ?? "../examples/fintech",
-    runtime: runtimeCapabilities(environment),
+    runtime,
     agentStallTimeoutMs: agentStallTimeoutMs(environment),
     auditRetentionDays: auditRetentionDays(environment),
     oauth: { google },
@@ -912,7 +950,7 @@ export function loadConfig(
       ? { appDistDir: optional(environment, "APP_DIST_DIR") as string }
       : {}),
     computer: computerConfig(environment),
-    handoff: handoffCaps(environment),
+    handoff,
     ...(optional(environment, "AGENT_TOOL_TOKEN")
       ? { agentToolToken: optional(environment, "AGENT_TOOL_TOKEN") as string }
       : {}),

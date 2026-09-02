@@ -23,8 +23,10 @@ import type { IdentityProviderStore } from "./auth/identity-provider-store";
 import type { ChannelEventHub } from "./channels/events";
 import { type ChannelStore, createChannelRoutes } from "./channels/routes";
 import type { ThreadIdentity } from "./channels/thread-identity";
-import { createThreadRoutes } from "./channels/thread-routes";
-import { createThreadReader } from "./channels/thread-status";
+import {
+  createThreadRoutes,
+  type ThreadReader,
+} from "./channels/thread-routes";
 import { createComponentRoutes } from "./components/routes";
 import type { SandboxedStore } from "./components/sandboxed";
 import { createSandboxedRoutes } from "./components/sandboxed-routes";
@@ -35,7 +37,6 @@ import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
-import { createIntelligenceClient } from "./intelligence-client";
 import type { OnboardingStore } from "./people/onboarding";
 import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
@@ -202,6 +203,17 @@ export function createApp(
    * nothing can finish.
    */
   onboardingStore?: OnboardingStore,
+  /**
+   * How a thread's continued existence is checked, built by whoever holds the
+   * Intelligence client. Appended last, like everything optional here: these are
+   * positional, and inserting one anywhere else silently shifts every call site.
+   *
+   * Absent leaves the thread routes unmounted rather than mounted and refusing — a
+   * standalone deployment has no Intelligence to ask about a thread, so it has no
+   * door for the question at all. It also keeps this module free of the runtime's
+   * import graph, which standalone must never evaluate.
+   */
+  threadReader?: ThreadReader,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -1046,19 +1058,10 @@ export function createApp(
     );
   }
 
-  if (threadIdentity && config.runtime.mode === "intelligence") {
+  if (threadIdentity && threadReader) {
     app.route(
       "/api/threads",
-      createThreadRoutes(
-        threadIdentity,
-        requireUser,
-        // The guarantee this comment once leaned on has loosened: a standalone deployment
-        // has no Intelligence to ask about a thread, so it has no reader to build and the
-        // routes stay unmounted — threads 404 by design there, like the chat runtime.
-        createThreadReader(
-          createIntelligenceClient(config.runtime.intelligence),
-        ),
-      ),
+      createThreadRoutes(threadIdentity, requireUser, threadReader),
     );
   }
 

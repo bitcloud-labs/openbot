@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
-import { mountCopilotRuntime } from "../src/copilot";
 import type { ThreadIdentity } from "../src/routing/thread-identity";
 import { testEnvironment } from "./support/environment";
 
@@ -16,7 +15,10 @@ import { testEnvironment } from "./support/environment";
  */
 
 function standaloneEnvironment() {
-  const environment = testEnvironment({ OPENBOT_SINGLE_USER: "true" });
+  const environment = testEnvironment({
+    OPENBOT_SINGLE_USER: "true",
+    OPENBOT_RUNTIME_MODE: "standalone",
+  });
   delete environment.INTELLIGENCE_API_URL;
   delete environment.INTELLIGENCE_GATEWAY_WS_URL;
   delete environment.INTELLIGENCE_API_KEY;
@@ -76,9 +78,21 @@ describe("a standalone deployment", () => {
     expect(response.status).toBe(404);
   });
 
-  test("mounting the chat runtime anyway is refused loudly", () => {
+  test("routines stay unmounted: a schedule that can never run must not be enableable", async () => {
+    // index.ts withholds the routine store in standalone; this proves the shape that
+    // wiring produces. A mounted management surface would let somebody enable an
+    // existing schedule the worker then dispatches into a 404, forever.
+    const app = createApp(config);
+    const response = await app.request("/api/routines");
+    expect(response.status).toBe(404);
+  });
+
+  test("mounting the chat runtime anyway is refused loudly", async () => {
     // The guard config.ts's old single-mode comment promised: if wiring ever tries to
     // mount the runtime without the contract, it must fail in front of the deployer.
+    // Imported dynamically, the way index.ts loads it: a static import here would
+    // couple this very suite to the runtime graph standalone exists to avoid.
+    const { mountCopilotRuntime } = await import("../src/copilot");
     expect(() =>
       mountCopilotRuntime(
         config,

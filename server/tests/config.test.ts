@@ -106,27 +106,65 @@ describe("deployment configuration", () => {
 
     const attempt = () => loadConfig(environment);
     expect(attempt).toThrow(`Missing: ${name}`);
-    expect(attempt).toThrow("unset all four to run standalone");
+    expect(attempt).toThrow("OPENBOT_RUNTIME_MODE=standalone");
   });
 
-  test("boots standalone when Intelligence is absent entirely", () => {
-    // The reversal of the old "refuses rather than degrading" decision, made deliberately for
-    // the BitMind execution enclave (bit-mind #20 / ADR-0002): a deployment that never meant to
-    // configure Intelligence gets a working admin surface and no chat runtime, not a refusal.
-    // Nothing is degraded silently — the mode is stated, and the chat/thread/routine surfaces
-    // are unmounted rather than mounted-and-refusing.
+  test("refuses to start when Intelligence is absent and standalone was not chosen", () => {
+    // A Kubernetes Secret that fails to mount makes all four values disappear at once.
+    // That must stay a crash in front of somebody, not a "healthy" deployment quietly
+    // missing its chat runtime — so total absence without the explicit mode refuses too.
+    expect(() =>
+      loadConfig({
+        DATABASE_URL: baseEnvironment.DATABASE_URL,
+        KEY_ENCRYPTION_KEY: baseEnvironment.KEY_ENCRYPTION_KEY,
+        MANAGED_AGENT_AG_UI_URL: baseEnvironment.MANAGED_AGENT_AG_UI_URL,
+        MANAGED_AGENT_TOKEN: baseEnvironment.MANAGED_AGENT_TOKEN,
+        OPENBOT_SINGLE_USER: "true",
+      }),
+    ).toThrow("CopilotKit Intelligence is not fully configured");
+  });
+
+  test("boots standalone when the deployment says it means it", () => {
+    // The mode the BitMind execution enclave runs (bit-mind #20 / ADR-0002): admin
+    // working, chat and threads unmounted. Explicit — the same shape as
+    // OPENBOT_SINGLE_USER — so a secret outage can never look like a choice.
     const config = loadConfig({
       DATABASE_URL: baseEnvironment.DATABASE_URL,
       KEY_ENCRYPTION_KEY: baseEnvironment.KEY_ENCRYPTION_KEY,
       MANAGED_AGENT_AG_UI_URL: baseEnvironment.MANAGED_AGENT_AG_UI_URL,
       MANAGED_AGENT_TOKEN: baseEnvironment.MANAGED_AGENT_TOKEN,
       OPENBOT_SINGLE_USER: "true",
+      OPENBOT_RUNTIME_MODE: "standalone",
     });
 
     expect(config.runtime).toEqual({
       mode: "standalone",
       durableHistory: false,
     });
+  });
+
+  test("standalone chosen with Intelligence values set is the contradiction it looks like", () => {
+    expect(() =>
+      loadConfig({ ...baseEnvironment, OPENBOT_RUNTIME_MODE: "standalone" }),
+    ).toThrow("contradicts");
+  });
+
+  test("standalone zeroes the handoff caps every consumer reads", () => {
+    // The capability endpoint, the grant surface and the delivery loop all derive
+    // "may Bots hand work off" from these caps; zeroing at the source keeps every
+    // answer the same, instead of a warning only one of them would reflect.
+    const config = loadConfig({
+      DATABASE_URL: baseEnvironment.DATABASE_URL,
+      KEY_ENCRYPTION_KEY: baseEnvironment.KEY_ENCRYPTION_KEY,
+      MANAGED_AGENT_AG_UI_URL: baseEnvironment.MANAGED_AGENT_AG_UI_URL,
+      MANAGED_AGENT_TOKEN: baseEnvironment.MANAGED_AGENT_TOKEN,
+      OPENBOT_SINGLE_USER: "true",
+      OPENBOT_RUNTIME_MODE: "standalone",
+      BOT_HANDOFF_MAX_DEPTH: "2",
+      BOT_HANDOFF_MAX_PER_RUN: "5",
+    });
+
+    expect(config.handoff).toEqual({ maxDepth: 0, maxPerRun: 0 });
   });
 
   test("rejects incomplete OAuth client configuration", () => {

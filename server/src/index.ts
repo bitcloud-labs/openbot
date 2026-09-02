@@ -319,7 +319,7 @@ const pluginStore = createPluginStore({
  * silent outage for this one.
  */
 const routineStore = createRoutineStore(database);
-useRoutineTools(routineStore);
+if (config.runtime.mode === "intelligence") useRoutineTools(routineStore);
 
 /**
  * Where a Bot handing work to another gets decided.
@@ -670,11 +670,15 @@ const intelligence =
           { mountCopilotRuntime, resolveRuntimeAgents },
           { createRuntimeAgentLoader },
           { createTurnRunner },
+          { createIntelligenceClient },
+          { createThreadReader },
         ] = await Promise.all([
           import("@copilotkit/runtime/v2"),
           import("./copilot"),
           import("./agents/runtime-agents"),
           import("./routines/run-turn"),
+          import("./intelligence-client"),
+          import("./channels/thread-status"),
         ]);
 
         const loadAgentsForActor = createRuntimeAgentLoader(
@@ -849,6 +853,12 @@ const intelligence =
           // The class itself, for the handoff delivery below: it must construct its
           // runner from the runtime's own connection, and only this branch loaded it.
           AgentRunner: IntelligenceAgentRunner,
+          // Thread status is a question only Intelligence can answer, so the reader
+          // is built here and handed to createApp — which mounts no thread routes
+          // without one, keeping app.ts free of the runtime's import graph.
+          threadReader: createThreadReader(
+            createIntelligenceClient(runtime.intelligence),
+          ),
         };
       })(config.runtime)
     : // Standalone: no chat runtime to mount. createApp leaves its routes off, so
@@ -883,19 +893,6 @@ const routineRunner = intelligence?.routineRunner;
  * deployment with the capability off, which is a deployment that never started one.
  */
 let workOfferedListener: WorkOfferedListener | undefined;
-
-if (
-  config.handoff.maxDepth > 0 &&
-  config.handoff.maxPerRun > 0 &&
-  !intelligence
-) {
-  // Configured on, but there is no runtime to deliver a hop through. Said out loud
-  // rather than silently ignored: the deployment asked for a capability standalone
-  // cannot provide.
-  console.warn(
-    "[handoff] handing work between Bots is configured on, but a standalone deployment has no runtime to deliver through; hops stay off.",
-  );
-}
 
 if (
   config.handoff.maxDepth > 0 &&
@@ -1123,10 +1120,14 @@ const app = createApp(
   pageFrameStore,
   // What a due routine actually does: a turn, run as its owner, into the thread they will open.
   routineRunner,
-  // A person's own standing instructions: the list, and a switch to stop one.
-  routineStore,
+  // A person's own standing instructions: the list, and a switch to stop one. Withheld
+  // in standalone: a schedule that can be enabled but never runs is a lie with a UI,
+  // and the worker would dispatch every due run into a 404.
+  intelligence ? routineStore : undefined,
   // Where each person is in first-run onboarding, read by /api/me and written by the wizard.
   createOnboardingStore(database),
+  // Present only when Intelligence is: threads are its conversations.
+  intelligence?.threadReader,
 );
 
 /**
