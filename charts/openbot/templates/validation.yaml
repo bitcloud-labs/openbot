@@ -87,6 +87,17 @@ This template renders nothing.
 {{- if (.Values.routines).enabled }}
 {{- fail "routines.enabled needs the intelligence runtime: a standalone server unmounts the routine surface, and a CronJob whose every dispatch is a 404 is worse than none. Disable routines, or drop config.runtimeMode=standalone." }}
 {{- end }}
+{{- /*
+  The escape hatch must not smuggle the mode back in. `config.extraEnv` renders after the
+  generated variables and the last duplicate name wins — deliberately, for every variable
+  except the ones that define which runtime this pod IS. An extraEnv entry naming one of
+  those would boot a pod in a mode this validation never saw.
+*/}}
+{{- range .Values.config.extraEnv }}
+{{- if has .name (list "OPENBOT_RUNTIME_MODE" "INTELLIGENCE_API_URL" "INTELLIGENCE_GATEWAY_WS_URL" "INTELLIGENCE_API_KEY" "COPILOTKIT_LICENSE_TOKEN") }}
+{{- fail (printf "config.extraEnv must not set %s in standalone: it would override the mode this chart validated. Configure the runtime through config.runtimeMode and config.intelligence.* instead." .name) }}
+{{- end }}
+{{- end }}
 {{- else }}
 {{- if or (not .Values.config.intelligence.apiUrl) (not .Values.config.intelligence.gatewayWsUrl) }}
 {{- fail "The intelligence runtime requires CopilotKit Intelligence. Set config.intelligence.apiUrl and config.intelligence.gatewayWsUrl, and the matching secrets.intelligenceApiKey and secrets.licenseToken — or set config.runtimeMode=standalone." }}
