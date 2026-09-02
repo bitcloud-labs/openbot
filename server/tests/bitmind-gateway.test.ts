@@ -430,3 +430,95 @@ describe("strict limits", () => {
     },
   );
 });
+
+describe("follow-up findings", () => {
+  test("a refusal over a still-streaming body ends the request before admitting more", async () => {
+    let downstreamAborted = false;
+    let bodyCancelled = false;
+    const refusing: typeof fetch = (_url, init) => {
+      init?.signal?.addEventListener("abort", () => {
+        downstreamAborted = true;
+      });
+      return Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("still talking\n"));
+              // Never closes on its own.
+            },
+            cancel() {
+              bodyCancelled = true;
+            },
+          }),
+          { status: 503, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    };
+    const gateway = createBitmindGateway(config(), refusing);
+    const response = await gateway.fetch(runRequest(runInput()));
+    expect(response.status).toBe(502);
+    expect(gateway.activeRuns()).toBe(0);
+    expect(downstreamAborted).toBe(true);
+    expect(bodyCancelled).toBe(true);
+  });
+
+  test.each(["text/event-streaming", "text/event-stream+json"])(
+    "a media type like %s is not the AG-UI wire",
+    async (contentType) => {
+      const gateway = createBitmindGateway(config(), () =>
+        Promise.resolve(
+          new Response("data: {}\n\n", {
+            status: 200,
+            headers: { "content-type": contentType },
+          }),
+        ),
+      );
+      const response = await gateway.fetch(runRequest(runInput()));
+      expect(response.status).toBe(502);
+      expect(gateway.activeRuns()).toBe(0);
+    },
+  );
+
+  test("parameters on the real media type survive the check and the forward", async () => {
+    const gateway = createBitmindGateway(config(), () =>
+      Promise.resolve(
+        new Response("data: {}\n\n", {
+          status: 200,
+          headers: { "content-type": "text/event-stream; charset=utf-8" },
+        }),
+      ),
+    );
+    const response = await gateway.fetch(runRequest(runInput()));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(
+      "text/event-stream; charset=utf-8",
+    );
+    await response.text();
+    expect(gateway.activeRuns()).toBe(0);
+  });
+
+  test("a caller that already hung up never reserves a slot or reaches the agent", async () => {
+    let reached = false;
+    const gateway = createBitmindGateway(config(), () => {
+      reached = true;
+      throw new Error("must not reach the agent");
+    });
+    // Abort events are not replayed: this signal fired before the gateway could
+    // listen, which is exactly the case a listener alone misses.
+    const controller = new AbortController();
+    const request = new Request("http://gateway/bitmind/v1/run", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SERVICE_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(runInput()),
+      signal: controller.signal,
+    });
+    controller.abort(new Error("caller gone"));
+    const response = await gateway.fetch(request);
+    expect(response.status).toBe(400);
+    expect(reached).toBe(false);
+    expect(gateway.activeRuns()).toBe(0);
+  });
+});

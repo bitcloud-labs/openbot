@@ -178,6 +178,17 @@ export function createBitmindGateway(
     request.signal.addEventListener("abort", () => {
       controller.abort(request.signal.reason as Error | undefined);
     });
+    // Abort events are not replayed: a caller that hung up while the body was still
+    // being read or validated has already fired its signal, and the listener above
+    // heard nothing. Checked AFTER registering, so a signal firing between the check
+    // and the listener cannot slip through either way — one of the two catches it.
+    if (request.signal.aborted) {
+      clearTimeout(timeout);
+      return Response.json(
+        { error: "The caller aborted before the run was relayed." },
+        { status: 400 },
+      );
+    }
     active.set(key, controller);
 
     let downstream: Response;
@@ -203,6 +214,11 @@ export function createBitmindGateway(
       );
     }
     if (!downstream.ok || !downstream.body) {
+      // A refusal can arrive as headers over a body that keeps streaming. The slot
+      // must not come back while that request is still live, so the fetch is
+      // aborted and the body ended before admission is released.
+      controller.abort(new Error("backend refused the run"));
+      await downstream.body?.cancel().catch(() => undefined);
       release();
       return Response.json(
         { error: "The execution backend refused the run." },
@@ -213,10 +229,15 @@ export function createBitmindGateway(
     // answers exactly that way. Only the AG-UI stream content type may be reserved
     // and reported to BitMind as a run in progress.
     const contentType = downstream.headers.get("content-type") ?? "";
-    if (!contentType.toLowerCase().startsWith("text/event-stream")) {
+    // The media type itself, exactly: startsWith would admit text/event-streaming
+    // and text/event-stream+json, neither of which is the AG-UI wire. Parameters
+    // after the first ";" (charset) are legitimate and preserved when forwarding.
+    const mediaType = (contentType.split(";", 1)[0] ?? "").trim().toLowerCase();
+    if (mediaType !== "text/event-stream") {
       controller.abort(
         new Error("backend did not answer with an event stream"),
       );
+      await downstream.body.cancel().catch(() => undefined);
       release();
       return Response.json(
         { error: "The execution backend did not answer with an event stream." },
