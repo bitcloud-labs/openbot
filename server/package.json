@@ -9,10 +9,13 @@
     "db:generate": "bun --env-file=../.env drizzle-kit generate --config=drizzle.config.ts",
     "db:migrate": "bun --env-file=../.env drizzle-kit migrate --config=drizzle.config.ts",
     "dev": "bun --env-file=../.env --watch src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bitmind:dev": "bun --env-file=../.env --watch src/bitmind/main.ts",
+    "bitmind:start": "bun src/bitmind/main.ts"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",
+    "@ag-ui/core": "0.0.57",
     "@better-auth/drizzle-adapter": "^1.7.1",
     "@better-auth/sso": "^1.7.1",
     "@copilotkit/runtime": "1.69.0",
