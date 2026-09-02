@@ -1,5 +1,4 @@
-import type { BaseEvent, RunAgentInput } from "@ag-ui/core";
-import { EventEncoder } from "@ag-ui/encoder";
+import type { RunAgentInput } from "@ag-ui/core";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { type AIMessage, ToolMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
@@ -14,7 +13,7 @@ import { serve } from "bun";
 import { hasManagedAgentToken } from "../../shared/agent-authorisation";
 import { toLangChainMessages } from "./history";
 import { readReasoningEffort } from "./model-options";
-import { streamRun } from "./stream";
+import { respondWithRun } from "./respond";
 
 /**
  * The same Bot, on a framework.
@@ -384,43 +383,20 @@ function buildGraph(input: RunAgentInput) {
     .compile();
 }
 
-async function runAgent(input: RunAgentInput): Promise<Response> {
-  const encoder = new EventEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const utf8 = new TextEncoder();
-      const send = (event: BaseEvent) =>
-        controller.enqueue(utf8.encode(encoder.encodeSSE(event)));
-
-      send({
-        type: "RUN_STARTED",
-        threadId: input.threadId,
-        runId: input.runId,
-      } as BaseEvent);
-
-      // The graph is built and its event stream opened inside `streamRun`, so a failure doing either
-      // is reported as RUN_ERROR through the same path as a failure mid-stream.
-      await streamRun(
-        async () =>
-          buildGraph(input).streamEvents(
-            { messages: toLangChainMessages(input) },
-            { version: "v2" },
-          ),
-        input,
-        send,
-      );
-
-      controller.close();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "content-type": encoder.getContentType(),
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
+function runAgent(input: RunAgentInput, clientSignal?: AbortSignal): Response {
+  // The graph is built and its event stream opened inside `streamRun`, so a failure
+  // doing either is reported as RUN_ERROR through the same path as a failure
+  // mid-stream. The signal reaches the framework itself: an aborted run stops the
+  // model call, not just the reading of it.
+  return respondWithRun(
+    input,
+    async (signal) =>
+      buildGraph(input).streamEvents(
+        { messages: toLangChainMessages(input) },
+        { version: "v2", signal },
+      ),
+    clientSignal,
+  );
 }
 
 serve({
@@ -444,7 +420,7 @@ serve({
         return Response.json({ error: "Unauthorized." }, { status: 401 });
       }
       const input = (await request.json()) as RunAgentInput;
-      return runAgent(input);
+      return runAgent(input, request.signal);
     }
 
     return Response.json({ error: "Not found." }, { status: 404 });

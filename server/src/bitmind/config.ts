@@ -41,10 +41,19 @@ function integer(
 ): number {
   const raw = environment[name]?.trim();
   if (!raw) return fallback;
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+  // The whole string or nothing: parseInt's numeric-prefix tolerance turns
+  // "2workers" into 2 and "1000ms" into 1000, which is a ceiling somebody believes
+  // they set and did not. A limit is a safety number; a malformed one must fail in
+  // front of whoever deployed it.
+  if (!/^\d+$/.test(raw)) {
     throw new Error(
-      `${name}=${raw} must be an integer between ${minimum} and ${maximum}.`,
+      `${name}=${raw} must be a whole number between ${minimum} and ${maximum}.`,
+    );
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(
+      `${name}=${raw} must be a whole number between ${minimum} and ${maximum}.`,
     );
   }
   return value;

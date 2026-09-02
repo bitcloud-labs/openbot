@@ -34,6 +34,7 @@ function runInput(runId = "run-1") {
       workspace_id: "workspace-1",
       agent_id: "agent-1",
       run_id: runId,
+      message_id: "message-1",
       fencing_token: 1,
     },
   };
@@ -232,18 +233,12 @@ describe("run relay", () => {
       hanging,
     );
     const responses = [
-      await gateway.fetch(
-        runRequest(runInput("run-1"), { "idempotency-key": "a" }),
-      ),
-      await gateway.fetch(
-        runRequest(runInput("run-2"), { "idempotency-key": "b" }),
-      ),
+      await gateway.fetch(runRequest(runInput("run-1"))),
+      await gateway.fetch(runRequest(runInput("run-2"))),
     ];
     expect(responses.map((r) => r.status)).toEqual([200, 200]);
 
-    const refused = await gateway.fetch(
-      runRequest(runInput("run-3"), { "idempotency-key": "c" }),
-    );
+    const refused = await gateway.fetch(runRequest(runInput("run-3")));
     expect(refused.status).toBe(429);
     expect(refused.headers.get("retry-after")).toBe("5");
 
@@ -297,4 +292,141 @@ describe("configuration", () => {
       }),
     ).toThrow(/http or https/);
   });
+});
+
+describe("identity enforcement", () => {
+  test("an attempt without its full identity statement is refused", async () => {
+    const gateway = createBitmindGateway(config(), () => {
+      throw new Error("must not reach the agent");
+    });
+    const input = runInput() as { forwardedProps: Record<string, unknown> };
+    delete input.forwardedProps.message_id;
+    const response = await gateway.fetch(runRequest(input));
+    expect(response.status).toBe(400);
+  });
+
+  test("a run whose envelope and identity disagree is refused", async () => {
+    const gateway = createBitmindGateway(config(), () => {
+      throw new Error("must not reach the agent");
+    });
+    const input = runInput("run-1") as { forwardedProps: { run_id: string } };
+    input.forwardedProps.run_id = "run-somebody-else";
+    const response = await gateway.fetch(runRequest(input));
+    expect(response.status).toBe(400);
+  });
+
+  test("the idempotency key is bound to the attempt, never caller-selectable", async () => {
+    const gateway = createBitmindGateway(config(), () => {
+      throw new Error("must not reach the agent");
+    });
+    const response = await gateway.fetch(
+      runRequest(runInput(), { "idempotency-key": "whatever-i-like" }),
+    );
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("capability enforcement", () => {
+  test("tools are refused while the attestation says tools: false", async () => {
+    let reached = false;
+    const gateway = createBitmindGateway(config(), () => {
+      reached = true;
+      throw new Error("must not reach the agent");
+    });
+    const input = runInput() as { tools: unknown[] };
+    input.tools = [
+      { name: "browser_navigate", description: "go", parameters: {} },
+    ];
+    const response = await gateway.fetch(runRequest(input));
+    expect(response.status).toBe(400);
+    expect(reached).toBe(false);
+  });
+
+  test("resume answers are refused while the attestation says interrupts: false", async () => {
+    let reached = false;
+    const gateway = createBitmindGateway(config(), () => {
+      reached = true;
+      throw new Error("must not reach the agent");
+    });
+    const input = runInput() as { resume?: unknown[] };
+    input.resume = [{ interruptId: "int-1", status: "resolved" }];
+    const response = await gateway.fetch(runRequest(input));
+    expect(response.status).toBe(400);
+    expect(reached).toBe(false);
+  });
+});
+
+describe("stream lifecycle", () => {
+  test("a backend that answers JSON is a 502, not a relayed run", async () => {
+    const gateway = createBitmindGateway(config(), () =>
+      Promise.resolve(
+        Response.json({ error: "please sign in" }, { status: 200 }),
+      ),
+    );
+    const response = await gateway.fetch(runRequest(runInput()));
+    expect(response.status).toBe(502);
+    expect(gateway.activeRuns()).toBe(0);
+  });
+
+  test("a source error mid-stream releases the slot", async () => {
+    const failing: typeof fetch = () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("data: {}\n\n"));
+              controller.error(new Error("backend fell over"));
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    const gateway = createBitmindGateway(config(), failing);
+    const response = await gateway.fetch(runRequest(runInput()));
+    expect(response.status).toBe(200);
+    await expect(response.text()).rejects.toThrow();
+    expect(gateway.activeRuns()).toBe(0);
+  });
+
+  test("a consumer that hangs up releases the slot and stops the backend", async () => {
+    let downstreamAborted = false;
+    const hanging: typeof fetch = (_url, init) => {
+      init?.signal?.addEventListener("abort", () => {
+        downstreamAborted = true;
+      });
+      return Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("data: {}\n\n"));
+              // Never closes: the consumer is the one who ends this.
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    };
+    const gateway = createBitmindGateway(config(), hanging);
+    const response = await gateway.fetch(runRequest(runInput()));
+    expect(response.status).toBe(200);
+    expect(gateway.activeRuns()).toBe(1);
+    await response.body?.cancel(new Error("BitMind hung up"));
+    expect(gateway.activeRuns()).toBe(0);
+    expect(downstreamAborted).toBe(true);
+  });
+});
+
+describe("strict limits", () => {
+  test.each(["2workers", "2.5", "1000ms", "-1", "1e3"])(
+    "a malformed ceiling like %s is refused, never coerced",
+    (value) => {
+      expect(() =>
+        bitmindGatewayConfig({
+          BITMIND_SERVICE_TOKEN: "token",
+          BITMIND_AGENT_TOKEN: "token",
+          BITMIND_MAX_CONCURRENT_RUNS: value,
+        }),
+      ).toThrow(/whole number/);
+    },
+  );
 });

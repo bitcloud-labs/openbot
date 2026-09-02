@@ -49,6 +49,10 @@ export async function streamRun(
   makeEvents: () => Promise<AsyncIterable<RunStreamEvent>>,
   input: Pick<RunAgentInput, "runId" | "threadId">,
   send: (event: BaseEvent) => void,
+  /** Aborted when the consumer hung up or the run was cancelled. The framework's own
+   *  stream gets the same signal and ends itself; this check is the belt for an
+   *  iterable that ignores it, so a cancelled run never keeps reading regardless. */
+  signal?: AbortSignal,
 ): Promise<void> {
   /*
    * One message id per stretch of prose.
@@ -92,6 +96,7 @@ export async function streamRun(
     >();
 
     for await (const event of events) {
+      if (signal?.aborted) break;
       if (event.event === "on_chat_model_stream") {
         /*
          * Both content shapes, because the API decides which one arrives.

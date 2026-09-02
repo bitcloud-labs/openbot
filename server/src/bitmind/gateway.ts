@@ -1,6 +1,25 @@
 import { RunAgentInputSchema } from "@ag-ui/core";
+import { z } from "zod";
 import { matchesToken } from "../../../shared/agent-authorisation";
 import { AG_UI_PROTOCOL_VERSION, type BitmindGatewayConfig } from "./config";
+
+/**
+ * BitMind's identity statement, required in full.
+ *
+ * The generic AG-UI envelope says nothing about who a run belongs to; this gateway
+ * refuses an attempt whose identity is missing or self-contradictory rather than
+ * relaying it and letting the far side guess. `fencing_token` is what makes a retry
+ * of the same claimed attempt recognisable, so it must be a whole number, and the
+ * `idempotency-key` header — when sent — must agree with it: a caller-selectable key
+ * detached from the run would defeat the double-start protection it exists for.
+ */
+const BitmindForwardedPropsSchema = z.object({
+  workspace_id: z.string().min(1),
+  agent_id: z.string().min(1).nullable(),
+  run_id: z.string().min(1),
+  message_id: z.string().min(1),
+  fencing_token: z.number().int().nonnegative(),
+});
 
 /**
  * The doorway BitMind talks through: one POST per run, answered with the AG-UI event
@@ -90,9 +109,49 @@ export function createBitmindGateway(
         { status: 400 },
       );
     }
+    const identity = BitmindForwardedPropsSchema.safeParse(
+      input.data.forwardedProps,
+    );
+    if (!identity.success) {
+      return Response.json(
+        { error: "forwardedProps must carry the BitMind identity statement." },
+        { status: 400 },
+      );
+    }
+    if (identity.data.run_id !== input.data.runId) {
+      return Response.json(
+        { error: "forwardedProps.run_id must match runId." },
+        { status: 400 },
+      );
+    }
+    // While the attestation says tools: false and interrupts: false, the gateway
+    // holds that boundary itself rather than trusting the far side to. A run
+    // carrying tools or resume answers is asking for capabilities nobody attested.
+    if (input.data.tools.length > 0) {
+      return Response.json(
+        { error: "This gateway attests tools: false and relays none." },
+        { status: 400 },
+      );
+    }
+    if ((input.data.resume?.length ?? 0) > 0) {
+      return Response.json(
+        {
+          error:
+            "This gateway attests interrupts: false and accepts no resume.",
+        },
+        { status: 400 },
+      );
+    }
 
-    const key =
-      request.headers.get("idempotency-key")?.trim() || input.data.runId;
+    const expectedKey = `${identity.data.run_id}:${String(identity.data.fencing_token)}`;
+    const offeredKey = request.headers.get("idempotency-key")?.trim();
+    if (offeredKey && offeredKey !== expectedKey) {
+      return Response.json(
+        { error: "idempotency-key must be run_id:fencing_token." },
+        { status: 400 },
+      );
+    }
+    const key = expectedKey;
     if (active.has(key)) {
       return Response.json(
         { error: "A run with this idempotency key is already streaming." },
@@ -150,20 +209,65 @@ export function createBitmindGateway(
         { status: 502 },
       );
     }
+    // A 2xx with a body is not yet an agent: a proxy login page or a JSON error
+    // answers exactly that way. Only the AG-UI stream content type may be reserved
+    // and reported to BitMind as a run in progress.
+    const contentType = downstream.headers.get("content-type") ?? "";
+    if (!contentType.toLowerCase().startsWith("text/event-stream")) {
+      controller.abort(
+        new Error("backend did not answer with an event stream"),
+      );
+      release();
+      return Response.json(
+        { error: "The execution backend did not answer with an event stream." },
+        { status: 502 },
+      );
+    }
 
-    const relayed = downstream.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        flush() {
+    // Pumped by hand rather than piped: the slot must come back on EVERY ending —
+    // clean close, source error, consumer cancellation, timeout — and a transform's
+    // flush() only runs for the first of those. The reader loop's finally is the one
+    // place all four paths pass through.
+    const reader = downstream.body.getReader();
+    const relayed = new ReadableStream<Uint8Array>({
+      async pull(streamController) {
+        let result: Awaited<ReturnType<typeof reader.read>>;
+        try {
+          result = await reader.read();
+        } catch (error) {
           release();
-        },
-      }),
+          streamController.error(error);
+          return;
+        }
+        if (result.done) {
+          release();
+          streamController.close();
+          return;
+        }
+        streamController.enqueue(result.value);
+      },
+      async cancel(reason) {
+        // BitMind hung up. The far side is told, not just abandoned: the model must
+        // stop working, and the slot comes back only alongside that abort.
+        controller.abort(
+          reason instanceof Error ? reason : new Error("relay cancelled"),
+        );
+        await reader.cancel(reason).catch(() => undefined);
+        release();
+      },
+    });
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        void reader.cancel(controller.signal.reason).catch(() => undefined);
+        release();
+      },
+      { once: true },
     );
-    controller.signal.addEventListener("abort", release, { once: true });
 
     return new Response(relayed, {
       headers: {
-        "content-type":
-          downstream.headers.get("content-type") ?? "text/event-stream",
+        "content-type": contentType,
         "cache-control": "no-cache",
       },
     });
