@@ -1,10 +1,13 @@
 # BitMind gateway
 
-The surface BitMind's run plane talks to, run as its own process
-(`server/src/bitmind/main.ts`) inside the execution enclave. It exists so the two
-sides can meet on the real protocol — AG-UI at the pinned `@ag-ui/core@0.0.57`
-(bit-mind ADR-0002) — before the full server learns to boot without the Intelligence
-contract.
+The surface BitMind's run plane talks to, served by the OpenBot server itself inside
+the execution enclave. It exists so the two sides can meet on the real protocol —
+AG-UI at the pinned `@ag-ui/core@0.0.57` (bit-mind ADR-0002).
+
+It began as a separate process, because the server refused to boot without the
+Intelligence contract and the enclave has none. Standalone mode removed that reason,
+so the gateway now boots with the server: one process for the enclave to supervise,
+one shutdown, one place a deployment's configuration is read.
 
 ## Surface
 
@@ -51,9 +54,37 @@ statement rides in `forwardedProps` — `workspace_id`, `agent_id`, `run_id`,
 
 ## Running it
 
+Set the variables and start the server as usual:
+
 ```
-BITMIND_SERVICE_TOKEN=… BITMIND_AGENT_TOKEN=… bun run --filter server bitmind:start
+OPENBOT_RUNTIME_MODE=standalone \
+BITMIND_SERVICE_TOKEN=… BITMIND_AGENT_TOKEN=… \
+bun run --filter server dev
 ```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BITMIND_SERVICE_TOKEN` | — | Required. What BitMind authenticates with. |
+| `BITMIND_AGENT_TOKEN` | — | Required. The downstream agent's managed-agent token. |
+| `BITMIND_AGENT_URL` | `http://localhost:4201/ag-ui` | Where runs are relayed. |
+| `BITMIND_GATEWAY_HOST` | `127.0.0.1` | Loopback unless deliberately changed. |
+| `BITMIND_GATEWAY_PORT` | `4310` | The gateway's own port. |
+| `BITMIND_MAX_CONCURRENT_RUNS` | `2` | Admission ceiling. |
+| `BITMIND_RUN_TIMEOUT_MS` | `900000` | Whole-run relay ceiling. |
+
+Setting none of them mounts no gateway; setting any of them requires all of the
+required ones, so a half-configured enclave fails at boot rather than answering
+BitMind with a server that cannot relay.
+
+### Why a second port rather than a path on the server's
+
+The gateway listens on its own host and port, in the server's process. The server's
+port is what an operator publishes — an ingress, a compose port mapping — and putting a
+service-token-authenticated relay on it would export the enclave's private surface
+wherever that port goes, without anybody choosing it. Loopback stays the default here,
+as bit-mind's `docs/operations/openbot-single-host-enclave.md` requires. A boot test
+asserts both halves: the gateway answers on its own port, and the server's port answers
+`404` to `/bitmind/v1/attestation` even with the service token in hand.
 
 It refuses to start without both tokens, binds loopback by default, and never holds
 BitMind database credentials, OIDC secrets, or the Docker socket — per the enclave

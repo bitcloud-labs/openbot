@@ -9,9 +9,7 @@
     "db:generate": "bun --env-file=../.env drizzle-kit generate --config=drizzle.config.ts",
     "db:migrate": "bun --env-file=../.env drizzle-kit migrate --config=drizzle.config.ts",
     "dev": "bun --env-file=../.env --watch src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "bitmind:dev": "bun --env-file=../.env --watch src/bitmind/main.ts",
-    "bitmind:start": "bun src/bitmind/main.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",
