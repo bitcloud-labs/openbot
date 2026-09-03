@@ -8,6 +8,8 @@ import type { BitmindAttestation } from "../src/bitmind/gateway";
 
 const SERVICE_TOKEN = "service-token-for-tests-0000000000000000";
 const AGENT_TOKEN = "managed-agent-token-for-tests-00000000";
+const SUPERVISOR_TOKEN = "supervisor-token-for-tests-00000000000";
+const SUPERVISOR_URL = "http://localhost:4300";
 
 function config(
   overrides: Partial<Parameters<typeof createBitmindGateway>[0]> = {},
@@ -72,6 +74,22 @@ function fakeAgent(events: object[]) {
   return { seen, agentFetch };
 }
 
+/**
+ * A fake supervisor, dispatched by URL the same way the gateway itself is only ever
+ * given one injected `fetch` — a test that needs both an agent and a supervisor
+ * combines two of these into one function rather than the gateway growing a second
+ * fetch parameter.
+ */
+function fakeSupervisor(respond: (url: URL, init?: RequestInit) => Response) {
+  const seen: { url?: string; init?: RequestInit } = {};
+  const supervisorFetch: typeof fetch = (url, init) => {
+    seen.url = String(url);
+    seen.init = init;
+    return Promise.resolve(respond(new URL(String(url)), init));
+  };
+  return { seen, supervisorFetch };
+}
+
 describe("authentication", () => {
   test("everything but /health requires the service token", async () => {
     const gateway = createBitmindGateway(config());
@@ -127,6 +145,159 @@ describe("attestation", () => {
       version: string;
     };
     expect(manifest.version).toBe(AG_UI_PROTOCOL_VERSION);
+  });
+
+  test("isolated_computers is true only while a configured supervisor answers", async () => {
+    const { supervisorFetch, seen } = fakeSupervisor(
+      () => new Response(null, { status: 200 }),
+    );
+    const withSupervisor = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      supervisorFetch,
+    );
+    const up = await withSupervisor.fetch(
+      new Request("http://gateway/bitmind/v1/attestation", {
+        headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+      }),
+    );
+    expect((await up.json<BitmindAttestation>()).isolated_computers).toBe(true);
+    // The supervisor's own health is unauthenticated, per its own design — this
+    // check must not need a token for it, and must not send one either.
+    expect(seen.url).toBe(`${SUPERVISOR_URL}/health`);
+    expect(seen.init?.headers).toBeUndefined();
+  });
+
+  test("isolated_computers is false when the supervisor is unreachable", async () => {
+    const down = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      () => Promise.reject(new Error("connect ECONNREFUSED")),
+    );
+    const response = await down.fetch(
+      new Request("http://gateway/bitmind/v1/attestation", {
+        headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+      }),
+    );
+    expect((await response.json<BitmindAttestation>()).isolated_computers).toBe(
+      false,
+    );
+  });
+
+  test("isolated_computers is false when the supervisor answers but is unwell", async () => {
+    const unwell = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      () => Promise.resolve(new Response(null, { status: 503 })),
+    );
+    const response = await unwell.fetch(
+      new Request("http://gateway/bitmind/v1/attestation", {
+        headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+      }),
+    );
+    expect((await response.json<BitmindAttestation>()).isolated_computers).toBe(
+      false,
+    );
+  });
+});
+
+describe("computer", () => {
+  function ensureRequest(agentId: string) {
+    return new Request(`http://gateway/bitmind/v1/computer/${agentId}/ensure`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+    });
+  }
+
+  test("is unavailable when no supervisor is configured", async () => {
+    const gateway = createBitmindGateway(config());
+    const response = await gateway.fetch(ensureRequest("agent-1"));
+    expect(response.status).toBe(503);
+  });
+
+  test("proxies to the supervisor and trims the response to what BitMind needs", async () => {
+    const { supervisorFetch, seen } = fakeSupervisor((url) => {
+      expect(url.pathname).toBe("/computers/agent-1/ensure");
+      return Response.json({
+        botId: "agent-1",
+        // Internal details a response to BitMind must never carry.
+        container: "openbot-computer-agent-1",
+        url: "http://openbot-computer-agent-1:4100",
+        identity: "spiffe://openbot.local/agent-1",
+        status: "running",
+        startedAt: "2026-09-03T00:00:00.000Z",
+      });
+    });
+    const gateway = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      supervisorFetch,
+    );
+    const response = await gateway.fetch(ensureRequest("agent-1"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      status: "running",
+      started_at: "2026-09-03T00:00:00.000Z",
+    });
+    expect(seen.init?.headers).toEqual({
+      authorization: `Bearer ${SUPERVISOR_TOKEN}`,
+    });
+  });
+
+  test("passes the supervisor's own status through on refusal, never its body", async () => {
+    const conflict = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      () =>
+        Promise.resolve(
+          Response.json(
+            { error: "A container named ... already exists ..." },
+            { status: 409 },
+          ),
+        ),
+    );
+    const response = await conflict.fetch(ensureRequest("agent-1"));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "The computer supervisor refused the request.",
+    });
+  });
+
+  test("an unreachable supervisor is a 502", async () => {
+    const unreachable = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+      () => Promise.reject(new Error("connect ECONNREFUSED")),
+    );
+    const response = await unreachable.fetch(ensureRequest("agent-1"));
+    expect(response.status).toBe(502);
+  });
+
+  test("requires the service token, like every other BitMind route", async () => {
+    const gateway = createBitmindGateway(
+      config({
+        supervisorUrl: SUPERVISOR_URL,
+        supervisorToken: SUPERVISOR_TOKEN,
+      }),
+    );
+    const bare = await gateway.fetch(
+      new Request("http://gateway/bitmind/v1/computer/agent-1/ensure", {
+        method: "POST",
+      }),
+    );
+    expect(bare.status).toBe(401);
   });
 });
 
@@ -289,6 +460,51 @@ describe("configuration", () => {
       bitmindGatewayConfig({
         ...base,
         BITMIND_AGENT_URL: "file:///etc/passwd",
+      }),
+    ).toThrow(/http or https/);
+  });
+
+  test("the supervisor's url and token are set together or not at all", () => {
+    const base = {
+      BITMIND_SERVICE_TOKEN: "token",
+      BITMIND_AGENT_TOKEN: "token",
+    };
+    // Neither set: a deployment with no supervisor, valid.
+    expect(bitmindGatewayConfig(base).supervisorUrl).toBeUndefined();
+    expect(() =>
+      bitmindGatewayConfig({
+        ...base,
+        BITMIND_SUPERVISOR_URL: "http://localhost:4300",
+      }),
+    ).toThrow(/BITMIND_SUPERVISOR_TOKEN/);
+    expect(() =>
+      bitmindGatewayConfig({ ...base, BITMIND_SUPERVISOR_TOKEN: "token" }),
+    ).toThrow(/BITMIND_SUPERVISOR_URL/);
+    const both = bitmindGatewayConfig({
+      ...base,
+      BITMIND_SUPERVISOR_URL: "http://localhost:4300",
+      BITMIND_SUPERVISOR_TOKEN: "token",
+    });
+    expect(both.supervisorUrl).toBe("http://localhost:4300");
+    expect(both.supervisorToken).toBe("token");
+  });
+
+  test("refuses a supervisor url that carries credentials or an odd scheme", () => {
+    const base = {
+      BITMIND_SERVICE_TOKEN: "token",
+      BITMIND_AGENT_TOKEN: "token",
+      BITMIND_SUPERVISOR_TOKEN: "token",
+    };
+    expect(() =>
+      bitmindGatewayConfig({
+        ...base,
+        BITMIND_SUPERVISOR_URL: "http://user:pw@host:4300",
+      }),
+    ).toThrow(/credentials/);
+    expect(() =>
+      bitmindGatewayConfig({
+        ...base,
+        BITMIND_SUPERVISOR_URL: "file:///etc/passwd",
       }),
     ).toThrow(/http or https/);
   });

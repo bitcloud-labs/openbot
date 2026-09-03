@@ -77,14 +77,36 @@ export function createBitmindGateway(
    */
   const active = new Map<string, AbortController>();
 
-  function attestation(): BitmindAttestation {
+  /**
+   * Whether the configured supervisor is actually there, right now.
+   *
+   * Checked on every attestation rather than cached: a stale "true" is the one this
+   * field must never say, because it is what turns BitMind's worker on. A supervisor
+   * that was reachable a minute ago and has since died must attest `false` on the
+   * very next check, not on the next restart. Health is unauthenticated on the
+   * supervisor's own side, so this asks nothing it would need a token for.
+   */
+  async function supervisorReachable(): Promise<boolean> {
+    if (!config.supervisorUrl) return false;
+    try {
+      const response = await fetchImplementation(
+        new URL("/health", config.supervisorUrl),
+        { signal: AbortSignal.timeout(3_000) },
+      );
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async function attestation(): Promise<BitmindAttestation> {
     return {
       service: "openbot-bitmind-gateway",
       protocol: { ag_ui: AG_UI_PROTOCOL_VERSION },
-      // No agent computers exist behind this gateway yet, so no isolation exists to
-      // attest. BitMind's activation gate requires true; false keeps its worker off,
-      // which is the correct state until the enclave provides real computers.
-      isolated_computers: false,
+      // True only when a supervisor is configured AND answering right now. Anything
+      // else is the pre-enclave state: no isolation exists to attest, so BitMind's
+      // worker must stay off.
+      isolated_computers: await supervisorReachable(),
       execution: { backend: "relay", tools: false, interrupts: false },
       limits: {
         max_concurrent_runs: config.maxConcurrentRuns,
@@ -92,6 +114,64 @@ export function createBitmindGateway(
       },
       active_runs: active.size,
     };
+  }
+
+  /**
+   * What BitMind is told when it asks for an agent's computer.
+   *
+   * Deliberately a small, named subset of what the supervisor returns — never the
+   * container name, the internal container-DNS url, or the raw identity/error text,
+   * none of which BitMind can use and none of which belongs on the wire to a
+   * different trust domain. `computer/control` and `computer/frames` (control
+   * transfer, live frames) are not implemented yet: `agent-computer` already has
+   * both as real features of its own (`/control/take`, `/stream`), but relaying a
+   * live CDP frame stream or a control-transfer session through this gateway is its
+   * own design question, not an extension of this one route.
+   */
+  async function ensureComputer(agentId: string): Promise<Response> {
+    if (!config.supervisorUrl || !config.supervisorToken) {
+      return Response.json(
+        { error: "This gateway has no computer supervisor configured." },
+        { status: 503 },
+      );
+    }
+    let downstream: Response;
+    try {
+      downstream = await fetchImplementation(
+        new URL(
+          `/computers/${encodeURIComponent(agentId)}/ensure`,
+          config.supervisorUrl,
+        ),
+        {
+          method: "POST",
+          signal: AbortSignal.timeout(config.runTimeoutMs),
+          headers: { authorization: `Bearer ${config.supervisorToken}` },
+        },
+      );
+    } catch {
+      return Response.json(
+        { error: "The computer supervisor is unreachable." },
+        { status: 502 },
+      );
+    }
+    if (!downstream.ok) {
+      // The supervisor's own status carries real meaning here (400 a bad agent id,
+      // 409 a name held elsewhere, 503 Docker itself unavailable) — passed through
+      // rather than flattened to one generic code, but never its response body,
+      // which is written for an operator, not for BitMind.
+      return Response.json(
+        { error: "The computer supervisor refused the request." },
+        { status: downstream.status },
+      );
+    }
+    const state = (await downstream.json()) as {
+      status?: string;
+      startedAt?: string;
+    };
+    return Response.json({
+      status: state.status ?? "unknown",
+      ...(state.startedAt ? { started_at: state.startedAt } : {}),
+    });
   }
 
   async function relayRun(request: Request): Promise<Response> {
@@ -325,10 +405,16 @@ export function createBitmindGateway(
         url.pathname === "/bitmind/v1/attestation" &&
         request.method === "GET"
       ) {
-        return Response.json(attestation());
+        return Response.json(await attestation());
       }
       if (url.pathname === "/bitmind/v1/run" && request.method === "POST") {
         return relayRun(request);
+      }
+      const computerEnsure = /^\/bitmind\/v1\/computer\/([^/]+)\/ensure$/.exec(
+        url.pathname,
+      );
+      if (computerEnsure && request.method === "POST") {
+        return ensureComputer(decodeURIComponent(computerEnsure[1] ?? ""));
       }
       return Response.json({ error: "Not found." }, { status: 404 });
     },
