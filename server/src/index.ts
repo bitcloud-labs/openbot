@@ -12,6 +12,7 @@ import { handoffTool } from "./agents/handoff-tool";
 import { createAgentProfileStore } from "./agents/profile-store";
 import type { AgentActor } from "./agents/profile-types";
 import { createApp } from "./app";
+import { bitmindGatewayFrom, serveBitmindGateway } from "./bitmind/mount";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
 import { startRetentionSweeps } from "./audit-retention";
 import { createAuth } from "./auth";
@@ -1276,6 +1277,25 @@ serve<SocketData>({
   },
 });
 
+/*
+ * BitMind's doorway, in this process.
+ *
+ * Configured or not: an ordinary deployment sets none of the BITMIND_* variables and
+ * gets no gateway. Where they are set they are validated in full, so a half-configured
+ * enclave fails here rather than answering BitMind with a server that cannot relay.
+ *
+ * On a listener of its own — see serveBitmindGateway for why the server's own port is
+ * the wrong place for a service-token surface. Same process, so the enclave supervises
+ * one thing and a signal stops both.
+ */
+const bitmind = bitmindGatewayFrom(process.env);
+const bitmindServer = bitmind ? serveBitmindGateway(bitmind) : undefined;
+if (bitmind) {
+  console.info(
+    `bitmind-gateway listening on http://${bitmind.listen.host}:${String(bitmind.listen.port)}/bitmind/v1 (agent: ${bitmind.config.agentUrl})`,
+  );
+}
+
 if (config.singleUser) {
   // Loud, every boot. A server that is not checking who is asking should never be a quiet default.
   console.warn(
@@ -1295,6 +1315,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       // Started only where handing work between Bots is switched on, so it is often not there.
       workOfferedListener?.stop() ?? Promise.resolve(),
       Promise.resolve(retentionSweeps.stop()),
+      // Stops accepting BitMind runs on the way out rather than dying mid-relay with
+      // the port still bound.
+      Promise.resolve(bitmindServer?.stop()),
     ]).finally(() => process.exit(0));
   });
 }
