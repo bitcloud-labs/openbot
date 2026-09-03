@@ -308,7 +308,19 @@ export type EnsureOptions = {
    * a test that wants an answer in seconds.
    */
   readyTimeoutMs?: number;
-  pidsLimit?: number;
+  /**
+   * A ceiling on the container's own process count. Defaults to 512 when left unset.
+   *
+   * Explicit `null` omits the field entirely rather than falling back to the default — for a
+   * host whose Docker daemon cannot register a PID cgroup limit at all (a rootless daemon whose
+   * systemd cgroup driver cannot complete a scope registration is a known case: creation fails
+   * with an OCI runtime error before the computer ever starts, not a soft degradation). Losing
+   * this control on such a host is a real reduction in defense-in-depth, not a free choice — a
+   * deployment disabling it is expected to compensate elsewhere (run timeouts, per-run
+   * concurrency ceilings, a watchdog that kills leaked containers, host-level process-count
+   * alerting), not merely to make computer creation succeed.
+   */
+  pidsLimit?: number | null;
   /**
    * The volume holding the SPIRE agent's Workload API socket, mounted read-only into each computer
    * so it can ask what it is. Unset means no identity, which is a deployment choice rather than a
@@ -361,7 +373,9 @@ function hostConfig(names: ComputerNames, options: EnsureOptions) {
     CapDrop: ["ALL"],
     // A runaway Bot is a resource problem for itself, not for every other Bot on the host.
     ...(options.memoryBytes ? { Memory: options.memoryBytes } : {}),
-    PidsLimit: options.pidsLimit ?? 512,
+    ...(options.pidsLimit === null
+      ? {}
+      : { PidsLimit: options.pidsLimit ?? 512 }),
     // Chromium's sandbox wants shared memory and will crash on the 64MB default.
     ShmSize: 1_073_741_824,
   };

@@ -158,6 +158,46 @@ describe.skipIf(runtime === null)("a computer that never answers", () => {
 });
 
 describe.skipIf(runtime === null)(
+  "the PID limit a computer is created with",
+  () => {
+    /*
+     * A rootless Docker daemon whose systemd cgroup driver cannot register a scope for a PID
+     * limit fails container creation outright — an OCI runtime error, not a soft degradation
+     * (found running this supervisor against a rootless enclave, #20). `pidsLimit: null` is the
+     * escape hatch: omit the field so creation does not depend on that cgroup path at all, rather
+     * than silently keep asking for a limit the daemon cannot grant.
+     */
+    test("defaults to 512", async () => {
+      await withDocker().supervisor.ensure(names, {
+        image: IMAGE,
+        environment: [],
+      });
+
+      const info = await withDocker()
+        .docker.getContainer(names.container)
+        .inspect();
+      expect(info.HostConfig?.PidsLimit).toBe(512);
+    }, 90_000);
+
+    test("explicit null omits it rather than falling back to the default", async () => {
+      await withDocker().supervisor.ensure(names, {
+        image: IMAGE,
+        environment: [],
+        pidsLimit: null,
+      });
+
+      const info = await withDocker()
+        .docker.getContainer(names.container)
+        .inspect();
+      // "No limit configured", not the 512 default — this daemon reports that as `null` rather
+      // than `0`, which is itself daemon-version-dependent, so the assertion is on the absence of
+      // a limit rather than pinning a specific sentinel value.
+      expect(info.HostConfig?.PidsLimit).toBeFalsy();
+    }, 90_000);
+  },
+);
+
+describe.skipIf(runtime === null)(
   "a computer built from an older image",
   () => {
     /*

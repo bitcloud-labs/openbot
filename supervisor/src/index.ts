@@ -57,6 +57,19 @@ const runtime = process.env.COMPUTER_RUNTIME;
 const memoryBytes = process.env.COMPUTER_MEMORY_BYTES
   ? Number.parseInt(process.env.COMPUTER_MEMORY_BYTES, 10)
   : undefined;
+/**
+ * Unset (the variable absent) leaves the 512 default in `docker.ts`. Set to the literal empty
+ * string, it means "this daemon cannot honour a PID limit" and is passed through as `null`,
+ * which omits the field from the container's HostConfig entirely rather than failing creation —
+ * see the `pidsLimit` doc comment in `docker.ts` for what a deployment must compensate with
+ * before disabling this.
+ */
+const pidsLimit =
+  process.env.COMPUTER_PIDS_LIMIT === ""
+    ? null
+    : process.env.COMPUTER_PIDS_LIMIT
+      ? Number.parseInt(process.env.COMPUTER_PIDS_LIMIT, 10)
+      : undefined;
 const spireSocketVolume = process.env.SPIRE_AGENT_SOCKET_VOLUME;
 
 /**
@@ -127,6 +140,7 @@ app.post("/computers/:botId/ensure", async (context) => {
       ...(network ? { network } : {}),
       ...(runtime ? { runtime } : {}),
       ...(memoryBytes ? { memoryBytes } : {}),
+      ...(pidsLimit === undefined ? {} : { pidsLimit }),
       ...(spireSocketVolume ? { spireSocketVolume } : {}),
     });
     return context.json({
