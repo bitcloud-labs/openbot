@@ -1,6 +1,7 @@
 import { RunAgentInputSchema } from "@ag-ui/core";
 import { z } from "zod";
 import { matchesToken } from "../../../shared/agent-authorisation";
+import type { ActionActor, ComputerGateway } from "../computer/gateway";
 import { AG_UI_PROTOCOL_VERSION, type BitmindGatewayConfig } from "./config";
 
 /**
@@ -23,16 +24,17 @@ const BitmindForwardedPropsSchema = z.object({
 
 /**
  * The doorway BitMind talks through: one POST per run, answered with the AG-UI event
- * stream, plus the attestation its activation gate reads before it will enable a
- * worker at all.
+ * stream, an observe/control surface for a Bot's computer, plus the attestation its
+ * activation gate reads before it will enable a worker at all.
  *
  * This is deliberately a relay and not a runtime. The downstream agent owns the model
- * conversation; this process owns what an enclave boundary needs owned on its edge —
+ * conversation, and the deployment's own `computer/` module (the same seam the
+ * product's own UI uses — one supervisor, one audit trail, no parallel path) owns a
+ * Bot's computer; this process owns what an enclave boundary needs owned on its edge —
  * service authentication, input validation against the pinned protocol schemas,
  * admission control, and an honest statement of what is and is not behind the door.
- * Nothing consequential can happen through it yet: the relayed agent is prose-only
- * (BitMind sends no tools and no computer exists here), which is exactly why
- * `isolated_computers` attests false and BitMind's worker stays disabled.
+ * `isolated_computers` attests true only while a configured computer provider is
+ * actually reachable — see `computersReachable`.
  *
  * Kept as a handler factory rather than a bound server, the way `agent-langgraph`
  * splits its logic from `serve()`, so tests drive it with plain Requests.
@@ -65,6 +67,7 @@ function bearerToken(request: Request): string {
 export function createBitmindGateway(
   config: BitmindGatewayConfig,
   fetchImplementation: typeof fetch = fetch,
+  computerGateway?: ComputerGateway,
 ) {
   /**
    * Runs currently relayed, by idempotency key.
@@ -78,22 +81,19 @@ export function createBitmindGateway(
   const active = new Map<string, AbortController>();
 
   /**
-   * Whether the configured supervisor is actually there, right now.
+   * Whether the deployment's own computer feature is actually there, right now.
    *
    * Checked on every attestation rather than cached: a stale "true" is the one this
-   * field must never say, because it is what turns BitMind's worker on. A supervisor
-   * that was reachable a minute ago and has since died must attest `false` on the
-   * very next check, not on the next restart. Health is unauthenticated on the
-   * supervisor's own side, so this asks nothing it would need a token for.
+   * field must never say, because it is what turns BitMind's worker on. `list()` is a
+   * read against the supervisor (or whichever provider is configured) that needs no
+   * particular Bot to exist, so it is the cheapest real proof of reachability this
+   * seam offers.
    */
-  async function supervisorReachable(): Promise<boolean> {
-    if (!config.supervisorUrl) return false;
+  async function computersReachable(): Promise<boolean> {
+    if (!computerGateway) return false;
     try {
-      const response = await fetchImplementation(
-        new URL("/health", config.supervisorUrl),
-        { signal: AbortSignal.timeout(3_000) },
-      );
-      return response.ok;
+      await computerGateway.provider.list();
+      return true;
     } catch {
       return false;
     }
@@ -103,10 +103,10 @@ export function createBitmindGateway(
     return {
       service: "openbot-bitmind-gateway",
       protocol: { ag_ui: AG_UI_PROTOCOL_VERSION },
-      // True only when a supervisor is configured AND answering right now. Anything
-      // else is the pre-enclave state: no isolation exists to attest, so BitMind's
-      // worker must stay off.
-      isolated_computers: await supervisorReachable(),
+      // True only when this deployment's own computer feature is configured AND
+      // answering right now. Anything else is the pre-enclave state: no isolation
+      // exists to attest, so BitMind's worker must stay off.
+      isolated_computers: await computersReachable(),
       execution: { backend: "relay", tools: false, interrupts: false },
       limits: {
         max_concurrent_runs: config.maxConcurrentRuns,
@@ -116,62 +116,126 @@ export function createBitmindGateway(
     };
   }
 
+  function computerUnavailable(): Response {
+    return Response.json(
+      { error: "This deployment has no computer feature configured." },
+      { status: 503 },
+    );
+  }
+
   /**
-   * What BitMind is told when it asks for an agent's computer.
+   * Maps every failure from the computer seam to one status, never the message.
    *
-   * Deliberately a small, named subset of what the supervisor returns — never the
-   * container name, the internal container-DNS url, or the raw identity/error text,
-   * none of which BitMind can use and none of which belongs on the wire to a
-   * different trust domain. `computer/control` and `computer/frames` (control
-   * transfer, live frames) are not implemented yet: `agent-computer` already has
-   * both as real features of its own (`/control/take`, `/stream`), but relaying a
-   * live CDP frame stream or a control-transfer session through this gateway is its
-   * own design question, not an extension of this one route.
+   * `ComputerUnavailableError`, `SupervisorError`, `ProviderError` and friends are all
+   * reachability/refusal failures from the same seam the product's own UI hits — none
+   * of their messages are written for a caller in a different trust domain, the same
+   * reasoning `relayRun` above already applies to the agent backend.
+   */
+  function computerErrorResponse(): Response {
+    return Response.json(
+      { error: "The computer backend refused the request." },
+      { status: 502 },
+    );
+  }
+
+  /**
+   * The actor BitMind's request names, for the audit trail a control handover writes.
+   *
+   * There is no row for this identity in `users` — BitMind's callers are not
+   * accounts this deployment has ever signed in — so only `id` is ever set, per
+   * `ActionActor`'s own contract ("Null unless this is a real row in users").
+   */
+  function actorFrom(request: Request): ActionActor | null {
+    const id = request.headers.get("x-bitmind-actor-id")?.trim();
+    return id ? { id: `bitmind:${id}` } : null;
+  }
+
+  /** `GET /bitmind/v1/computer/{agent_id}` — observes without starting anything. */
+  async function computerStatus(agentId: string): Promise<Response> {
+    if (!computerGateway) return computerUnavailable();
+    try {
+      return Response.json(await computerGateway.status(agentId));
+    } catch {
+      return computerErrorResponse();
+    }
+  }
+
+  /**
+   * `POST /bitmind/v1/computer/{agent_id}/ensure` — starts the computer if it is not
+   * already running, then reports where it actually is. `ComputerGateway.locate`
+   * validates the address itself (private-host checks, the same ones the product's
+   * own agent path gets), which a bespoke fetch straight to the supervisor would not.
    */
   async function ensureComputer(agentId: string): Promise<Response> {
-    if (!config.supervisorUrl || !config.supervisorToken) {
-      return Response.json(
-        { error: "This gateway has no computer supervisor configured." },
-        { status: 503 },
-      );
-    }
-    let downstream: Response;
+    if (!computerGateway) return computerUnavailable();
     try {
-      downstream = await fetchImplementation(
-        new URL(
-          `/computers/${encodeURIComponent(agentId)}/ensure`,
-          config.supervisorUrl,
-        ),
-        {
-          method: "POST",
-          signal: AbortSignal.timeout(config.runTimeoutMs),
-          headers: { authorization: `Bearer ${config.supervisorToken}` },
-        },
-      );
+      await computerGateway.locate(agentId);
+      return Response.json(await computerGateway.status(agentId));
     } catch {
+      return computerErrorResponse();
+    }
+  }
+
+  /** `GET /bitmind/v1/computer/{agent_id}/screenshot` — a snapshot, not a video pipe. */
+  async function computerScreenshot(agentId: string): Promise<Response> {
+    if (!computerGateway) return computerUnavailable();
+    try {
+      return Response.json(await computerGateway.screenshot(agentId));
+    } catch {
+      return computerErrorResponse();
+    }
+  }
+
+  /**
+   * `POST /bitmind/v1/computer/{agent_id}/control` — the handover verb. `agent-
+   * computer` already has a full control-transfer state machine
+   * (`/control/take`+`/control/release`); this is the two calls that reach it, not a
+   * new one. Live frames (a websocket relay of `agent-computer`'s CDP screencast) are
+   * the one piece of the original "observe/control/frame" scope still not done —
+   * `screenshot` above covers the polling case bit-bot#58 itself describes as the
+   * baseline ("a snapshot URL, not a video pipe"; streaming is named there as a later
+   * upgrade), so it is not blocking, but it is not this route either.
+   */
+  const ControlActionSchema = z.object({
+    action: z.enum(["take", "release"]),
+  });
+  async function computerControl(
+    agentId: string,
+    request: Request,
+  ): Promise<Response> {
+    if (!computerGateway) return computerUnavailable();
+    const actor = actorFrom(request);
+    if (!actor) {
       return Response.json(
-        { error: "The computer supervisor is unreachable." },
-        { status: 502 },
+        {
+          error:
+            "x-bitmind-actor-id is required to change who controls a computer.",
+        },
+        { status: 400 },
       );
     }
-    if (!downstream.ok) {
-      // The supervisor's own status carries real meaning here (400 a bad agent id,
-      // 409 a name held elsewhere, 503 Docker itself unavailable) — passed through
-      // rather than flattened to one generic code, but never its response body,
-      // which is written for an operator, not for BitMind.
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "Body must be JSON." }, { status: 400 });
+    }
+    const input = ControlActionSchema.safeParse(body);
+    if (!input.success) {
       return Response.json(
-        { error: "The computer supervisor refused the request." },
-        { status: downstream.status },
+        { error: 'action must be "take" or "release".' },
+        { status: 400 },
       );
     }
-    const state = (await downstream.json()) as {
-      status?: string;
-      startedAt?: string;
-    };
-    return Response.json({
-      status: state.status ?? "unknown",
-      ...(state.startedAt ? { started_at: state.startedAt } : {}),
-    });
+    try {
+      const state =
+        input.data.action === "take"
+          ? await computerGateway.takeControl(agentId, actor)
+          : await computerGateway.releaseControl(agentId, actor);
+      return Response.json(state);
+    } catch {
+      return computerErrorResponse();
+    }
   }
 
   async function relayRun(request: Request): Promise<Response> {
@@ -410,11 +474,23 @@ export function createBitmindGateway(
       if (url.pathname === "/bitmind/v1/run" && request.method === "POST") {
         return relayRun(request);
       }
-      const computerEnsure = /^\/bitmind\/v1\/computer\/([^/]+)\/ensure$/.exec(
-        url.pathname,
-      );
-      if (computerEnsure && request.method === "POST") {
-        return ensureComputer(decodeURIComponent(computerEnsure[1] ?? ""));
+      const computerMatch =
+        /^\/bitmind\/v1\/computer\/([^/]+)(\/[a-z]+)?$/.exec(url.pathname);
+      if (computerMatch) {
+        const agentId = decodeURIComponent(computerMatch[1] ?? "");
+        const sub = computerMatch[2];
+        if (!sub && request.method === "GET") {
+          return computerStatus(agentId);
+        }
+        if (sub === "/ensure" && request.method === "POST") {
+          return ensureComputer(agentId);
+        }
+        if (sub === "/screenshot" && request.method === "GET") {
+          return computerScreenshot(agentId);
+        }
+        if (sub === "/control" && request.method === "POST") {
+          return computerControl(agentId, request);
+        }
       }
       return Response.json({ error: "Not found." }, { status: 404 });
     },

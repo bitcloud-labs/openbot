@@ -24,16 +24,6 @@ export interface BitmindGatewayConfig {
   maxConcurrentRuns: number;
   /** Whole-run ceiling on the relay, so an abandoned stream cannot hold a slot. */
   runTimeoutMs: number;
-  /**
-   * The container supervisor, when this enclave has one. Both this and `supervisorToken`
-   * are set together or not at all — a half-configured pair is a deployment mistake, not a
-   * degraded mode, so it fails at boot rather than reporting an honest-looking `false`
-   * for a reason nobody chose. Absent, the gateway attests `isolated_computers: false`
-   * unconditionally, the same as before a supervisor existed at all.
-   */
-  supervisorUrl?: string;
-  /** Bearer token the supervisor requires. Never logged, never echoed. */
-  supervisorToken?: string;
 }
 
 /** Where the gateway listens. Loopback by default: the enclave boundary requires it. */
@@ -95,39 +85,10 @@ export function bitmindGatewayConfig(
       `BITMIND_AGENT_URL must be http or https, not ${parsed.protocol}`,
     );
   }
-  const supervisorUrlRaw = environment.BITMIND_SUPERVISOR_URL?.trim();
-  const supervisorToken = environment.BITMIND_SUPERVISOR_TOKEN?.trim();
-  if (supervisorUrlRaw && !supervisorToken) {
-    throw new Error(
-      "BITMIND_SUPERVISOR_URL is set without BITMIND_SUPERVISOR_TOKEN. Set both, or neither to run without computer isolation.",
-    );
-  }
-  if (supervisorToken && !supervisorUrlRaw) {
-    throw new Error(
-      "BITMIND_SUPERVISOR_TOKEN is set without BITMIND_SUPERVISOR_URL. Set both, or neither to run without computer isolation.",
-    );
-  }
-  if (supervisorUrlRaw) {
-    const parsedSupervisor = new URL(supervisorUrlRaw);
-    if (parsedSupervisor.username || parsedSupervisor.password) {
-      throw new Error("BITMIND_SUPERVISOR_URL must not carry credentials.");
-    }
-    if (
-      parsedSupervisor.protocol !== "http:" &&
-      parsedSupervisor.protocol !== "https:"
-    ) {
-      throw new Error(
-        `BITMIND_SUPERVISOR_URL must be http or https, not ${parsedSupervisor.protocol}`,
-      );
-    }
-  }
   return {
     serviceToken,
     agentToken,
     agentUrl,
-    ...(supervisorUrlRaw && supervisorToken
-      ? { supervisorUrl: supervisorUrlRaw, supervisorToken }
-      : {}),
     // The enclave note starts staging at two concurrent agent computers; the same
     // ceiling applies to runs until computers exist at all.
     maxConcurrentRuns: integer(

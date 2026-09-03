@@ -1,4 +1,5 @@
 import { serve } from "bun";
+import type { ComputerGateway } from "../computer/gateway";
 import {
   bitmindGatewayConfig,
   bitmindGatewayListen,
@@ -23,8 +24,6 @@ const GATEWAY_VARIABLES = [
   "BITMIND_GATEWAY_PORT",
   "BITMIND_MAX_CONCURRENT_RUNS",
   "BITMIND_RUN_TIMEOUT_MS",
-  "BITMIND_SUPERVISOR_URL",
-  "BITMIND_SUPERVISOR_TOKEN",
 ] as const;
 
 export interface BitmindGatewayMount {
@@ -38,9 +37,17 @@ export interface BitmindGatewayMount {
  *
  * Returns undefined only when the environment says nothing about BitMind at all: an
  * ordinary OpenBot deployment mounts no gateway and needs no opinion about one.
+ *
+ * `computerGateway` is the SAME instance `index.ts` already built for the deployment's
+ * own computer feature (`undefined` when none is configured) — passed through rather
+ * than this module building a second one. There is one computer supervisor per
+ * deployment, one `COMPUTER_SUPERVISOR_URL`, one audit trail; BitMind reaches Bots'
+ * computers through the identical seam the product's own UI does, not a parallel path
+ * with its own idea of what a computer's address or state looks like.
  */
 export function bitmindGatewayFrom(
   environment: NodeJS.ProcessEnv,
+  computerGateway?: ComputerGateway,
 ): BitmindGatewayMount | undefined {
   const mentioned = GATEWAY_VARIABLES.some((name) =>
     Boolean(environment[name]?.trim()),
@@ -50,7 +57,7 @@ export function bitmindGatewayFrom(
   return {
     config,
     listen: bitmindGatewayListen(environment),
-    gateway: createBitmindGateway(config),
+    gateway: createBitmindGateway(config, undefined, computerGateway),
   };
 }
 
