@@ -1288,7 +1288,7 @@ serve<SocketData>({
  * the wrong place for a service-token surface. Same process, so the enclave supervises
  * one thing and a signal stops both.
  */
-const bitmind = bitmindGatewayFrom(process.env);
+const bitmind = bitmindGatewayFrom(process.env, computerGateway);
 const bitmindServer = bitmind ? serveBitmindGateway(bitmind) : undefined;
 if (bitmind) {
   console.info(

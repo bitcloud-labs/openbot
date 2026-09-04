@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { ComputerGateway } from "../src/computer/gateway";
 import {
   AG_UI_PROTOCOL_VERSION,
   bitmindGatewayConfig,
@@ -8,6 +9,34 @@ import type { BitmindAttestation } from "../src/bitmind/gateway";
 
 const SERVICE_TOKEN = "service-token-for-tests-0000000000000000";
 const AGENT_TOKEN = "managed-agent-token-for-tests-00000000";
+
+/**
+ * A computer gateway with every method stubbed to fail loudly, so a test that
+ * overrides only the two or three methods it exercises cannot silently pass by
+ * calling into a method it never meant to reach — the same
+ * `as unknown as ComputerGateway` partial-fake pattern `computer-routes.test.ts`
+ * already establishes for this same interface.
+ */
+function fakeComputerGateway(
+  overrides: Partial<ComputerGateway> = {},
+): ComputerGateway {
+  const unexpected = (name: string) => () => {
+    throw new Error(
+      `fakeComputerGateway.${name} was not expected to be called`,
+    );
+  };
+  return {
+    provider: {
+      list: async () => [],
+    } as unknown as ComputerGateway["provider"],
+    locate: unexpected("locate"),
+    status: unexpected("status"),
+    screenshot: unexpected("screenshot"),
+    takeControl: unexpected("takeControl"),
+    releaseControl: unexpected("releaseControl"),
+    ...overrides,
+  } as unknown as ComputerGateway;
+}
 
 function config(
   overrides: Partial<Parameters<typeof createBitmindGateway>[0]> = {},
@@ -108,8 +137,8 @@ describe("attestation", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as BitmindAttestation;
     expect(body.protocol.ag_ui).toBe(AG_UI_PROTOCOL_VERSION);
-    // No enclave computers exist behind this gateway yet: attesting true here would
-    // switch BitMind's worker on against isolation that does not exist.
+    // No computer gateway configured: attesting true here would switch BitMind's
+    // worker on against isolation that does not exist.
     expect(body.isolated_computers).toBe(false);
     expect(body.execution).toEqual({
       backend: "relay",
@@ -127,6 +156,263 @@ describe("attestation", () => {
       version: string;
     };
     expect(manifest.version).toBe(AG_UI_PROTOCOL_VERSION);
+  });
+
+  test("isolated_computers is true only while the computer gateway answers", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({ provider: { list: async () => [] } as never }),
+    );
+    const up = await gateway.fetch(
+      new Request("http://gateway/bitmind/v1/attestation", {
+        headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+      }),
+    );
+    expect((await up.json<BitmindAttestation>()).isolated_computers).toBe(true);
+  });
+
+  test("isolated_computers is false when the computer gateway's own provider fails", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        provider: {
+          list: () => Promise.reject(new Error("supervisor unreachable")),
+        } as never,
+      }),
+    );
+    const response = await gateway.fetch(
+      new Request("http://gateway/bitmind/v1/attestation", {
+        headers: { authorization: `Bearer ${SERVICE_TOKEN}` },
+      }),
+    );
+    expect((await response.json<BitmindAttestation>()).isolated_computers).toBe(
+      false,
+    );
+  });
+});
+
+describe("computer", () => {
+  function request(
+    agentId: string,
+    sub: string,
+    init: RequestInit = {},
+  ): Request {
+    return new Request(`http://gateway/bitmind/v1/computer/${agentId}${sub}`, {
+      ...init,
+      headers: { authorization: `Bearer ${SERVICE_TOKEN}`, ...init.headers },
+    });
+  }
+
+  test("a malformed percent-escape in the agent id is a 404, not a thrown URIError", async () => {
+    // `decodeURIComponent("%")` throws, and this handler is the outermost frame, so an
+    // unguarded decode answered a bad path with an unhandled error instead of a status.
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway(),
+    );
+    for (const path of ["%", "%zz", "a%2"]) {
+      const response = await gateway.fetch(request(path, ""));
+      expect(response.status).toBe(404);
+    }
+  });
+
+  test("every route is unavailable when no computer gateway is configured", async () => {
+    const gateway = createBitmindGateway(config());
+    for (const req of [
+      request("agent-1", ""),
+      request("agent-1", "/ensure", { method: "POST" }),
+      request("agent-1", "/screenshot"),
+      request("agent-1", "/control", {
+        method: "POST",
+        headers: { "x-bitmind-actor-id": "user-1" },
+        body: JSON.stringify({ action: "take" }),
+      }),
+    ]) {
+      const response = await gateway.fetch(req);
+      expect(response.status).toBe(503);
+    }
+  });
+
+  test("requires the service token, like every other BitMind route", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway(),
+    );
+    const bare = await gateway.fetch(
+      new Request("http://gateway/bitmind/v1/computer/agent-1", {
+        method: "GET",
+      }),
+    );
+    expect(bare.status).toBe(401);
+  });
+
+  test("GET observes status without starting anything", async () => {
+    const seen: string[] = [];
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        status: async (botId) => {
+          seen.push(botId);
+          return { botId, state: "absent" };
+        },
+      }),
+    );
+    const response = await gateway.fetch(request("agent-1", ""));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      botId: "agent-1",
+      state: "absent",
+    });
+    expect(seen).toEqual(["agent-1"]);
+  });
+
+  test("ensure locates (starting if needed) and reports the resulting status", async () => {
+    const located: string[] = [];
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        locate: async (botId) => {
+          located.push(botId);
+          return "http://openbot-computer-agent-1:4100";
+        },
+        status: async (botId) => ({ botId, state: "ready" }),
+      }),
+    );
+    const response = await gateway.fetch(
+      request("agent-1", "/ensure", { method: "POST" }),
+    );
+    expect(response.status).toBe(200);
+    // Never the address `locate` resolved — that is an internal container-DNS url,
+    // not something BitMind can reach or should see.
+    expect(await response.json()).toEqual({ botId: "agent-1", state: "ready" });
+    expect(located).toEqual(["agent-1"]);
+  });
+
+  test("screenshot passes the gateway's own result through", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        screenshot: async () => ({
+          base64: "aGVsbG8=",
+          width: 1280,
+          height: 800,
+          capturedAt: "2026-09-03T00:00:00.000Z",
+          url: "https://example.com",
+        }),
+      }),
+    );
+    const response = await gateway.fetch(request("agent-1", "/screenshot"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      base64: "aGVsbG8=",
+      width: 1280,
+      height: 800,
+      capturedAt: "2026-09-03T00:00:00.000Z",
+      url: "https://example.com",
+    });
+  });
+
+  test("control take and release call the matching verb with an actor from the request", async () => {
+    const calls: { verb: string; botId: string; actor: unknown }[] = [];
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        takeControl: async (botId, actor) => {
+          calls.push({ verb: "take", botId, actor });
+          return { holder: "human", since: "now", requested: false };
+        },
+        releaseControl: async (botId, actor) => {
+          calls.push({ verb: "release", botId, actor });
+          return { holder: "bot", since: "now", requested: false };
+        },
+      }),
+    );
+    const take = await gateway.fetch(
+      request("agent-1", "/control", {
+        method: "POST",
+        headers: { "x-bitmind-actor-id": "person-7" },
+        body: JSON.stringify({ action: "take" }),
+      }),
+    );
+    expect(take.status).toBe(200);
+    expect(await take.json()).toEqual({
+      holder: "human",
+      since: "now",
+      requested: false,
+    });
+
+    const release = await gateway.fetch(
+      request("agent-1", "/control", {
+        method: "POST",
+        headers: { "x-bitmind-actor-id": "person-7" },
+        body: JSON.stringify({ action: "release" }),
+      }),
+    );
+    expect(release.status).toBe(200);
+
+    expect(calls).toEqual([
+      { verb: "take", botId: "agent-1", actor: { id: "bitmind:person-7" } },
+      { verb: "release", botId: "agent-1", actor: { id: "bitmind:person-7" } },
+    ]);
+  });
+
+  test("control without an actor is refused before it reaches the gateway", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        takeControl: () => {
+          throw new Error("must not be called without an actor");
+        },
+      }),
+    );
+    const response = await gateway.fetch(
+      request("agent-1", "/control", {
+        method: "POST",
+        body: JSON.stringify({ action: "take" }),
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("control with an invalid action is refused", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway(),
+    );
+    const response = await gateway.fetch(
+      request("agent-1", "/control", {
+        method: "POST",
+        headers: { "x-bitmind-actor-id": "person-7" },
+        body: JSON.stringify({ action: "reboot" }),
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("a failure anywhere in the computer seam is a 502, never the underlying message", async () => {
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway({
+        status: () =>
+          Promise.reject(new Error("supervisor said something private")),
+      }),
+    );
+    const response = await gateway.fetch(request("agent-1", ""));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: "The computer backend refused the request.",
+    });
   });
 });
 
