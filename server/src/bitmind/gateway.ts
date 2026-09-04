@@ -477,7 +477,16 @@ export function createBitmindGateway(
       const computerMatch =
         /^\/bitmind\/v1\/computer\/([^/]+)(\/[a-z]+)?$/.exec(url.pathname);
       if (computerMatch) {
-        const agentId = decodeURIComponent(computerMatch[1] ?? "");
+        // A malformed percent-escape (`/computer/%`) makes `decodeURIComponent` throw,
+        // and this handler is the outermost frame — an unguarded decode turns a bad
+        // path into an unhandled error rather than an answer. It is not a route this
+        // gateway serves either way, so it gets the same 404 as any other miss.
+        let agentId: string;
+        try {
+          agentId = decodeURIComponent(computerMatch[1] ?? "");
+        } catch {
+          return Response.json({ error: "Not found." }, { status: 404 });
+        }
         const sub = computerMatch[2];
         if (!sub && request.method === "GET") {
           return computerStatus(agentId);

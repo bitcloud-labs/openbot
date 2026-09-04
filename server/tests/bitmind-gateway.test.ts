@@ -205,6 +205,20 @@ describe("computer", () => {
     });
   }
 
+  test("a malformed percent-escape in the agent id is a 404, not a thrown URIError", async () => {
+    // `decodeURIComponent("%")` throws, and this handler is the outermost frame, so an
+    // unguarded decode answered a bad path with an unhandled error instead of a status.
+    const gateway = createBitmindGateway(
+      config(),
+      undefined,
+      fakeComputerGateway(),
+    );
+    for (const path of ["%", "%zz", "a%2"]) {
+      const response = await gateway.fetch(request(path, ""));
+      expect(response.status).toBe(404);
+    }
+  });
+
   test("every route is unavailable when no computer gateway is configured", async () => {
     const gateway = createBitmindGateway(config());
     for (const req of [
