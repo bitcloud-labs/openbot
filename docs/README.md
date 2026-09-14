@@ -13,5 +13,6 @@ Start with the root [README](../README.md), then use these references:
 - [Deployment](deployment.md): the container, what is in the image, minimum sizes, and the platform notes.
 - [Kubernetes](../charts/openbot/README.md): the Helm chart, what a cluster needs before it, and the values that differ per cloud.
 - [Releasing](releasing.md): how a release is proposed, reviewed and published.
+- [Launch readiness: OpenBot computers (BitMind as caller)](LAUNCH-READINESS-bitmind-openbot.md): draft findings only — prefers the production-ish `openbot-private` clone (VPS `/home/dev/apps/openbot`) for the BitMind / Bit Bot path. Public `main` is the tracking fork. BitMind itself is an external repo. Do not treat it as a feature or a deploy plan.
 
 Do not include credential values, customer data, transcripts, or local-only notes in public docs.
