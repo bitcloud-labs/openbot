@@ -1,347 +1,287 @@
-# Launch readiness: BitMind + OpenBot
+# Launch readiness: OpenBot computers (BitMind as caller)
 
 **Status:** draft findings only. Do not merge as if it were a feature. Do not deploy.
 **Assessor:** kit skill `code-reviewer` (`agent_id` `0f542ca8-9438-4cb5-a409-0c2eaef68197`).
-**Date:** 2026-09-14.
-**Question:** how far until Bit Bot can launch with real agents and real computers?
-**Headline:** **~35% ready.** OpenBot already has computers, a CEL gateway, and Chromium. BitMind already has threads, a worker, and a real AG-UI adapter. The product cannot launch because those two planes are not joined for a signed-in bit-bot-site user, computers are not attested on public `main`, and both chat (Qwen) and computer-use (UI-TARS) are SPEC-only.
+**Date:** 2026-09-14. Recast the same day: this review is **OpenBot-only**.
+**Question:** how far until Bit Bot can launch with real agents and real computers, **from this execution plane**?
+**Headline:** **~45% ready on the OpenBot side.** Per-bot Chromium, the CEL decide-before / audit-after gateway, and the supervisor are built. The BitMind-facing door on public `main` is still a prose-only relay that attests `isolated_computers: false`. Computers are not behind that door until PR #5 / `openbot-private` lands. UI-TARS is not in this tree.
 
 No secrets, host credentials, or token values appear in this document. Environment **names** only.
 
 ---
 
-## Scope and where each plane lives
+## Scope
 
-The product stack is **Bit Bot client → BitMind (orchestration / threads / identity) → OpenBot (computers + CEL gateway + Chromium)**. BitMind is **not** a package in this monorepo. It is a sibling service.
+This file reviews **`bitcloud-labs/openbot`** (`main` @ `ac1b7d1`): computers, CEL policy, Chromium, the supervisor, and the contract OpenBot exposes for BitMind.
 
-| Plane | Repository | Role |
+**BitMind is an external dependency**, not a package in this monorepo. It lives at [`bitcloud-labs/bit-mind`](https://github.com/bitcloud-labs/bit-mind) — durable control plane and orchestration for BitBot (threads, identity, runs). Another agent is reviewing that repo. This document names the **caller contract** OpenBot already implements and the **gaps on this side of the wire**. It does not score BitMind internals.
+
+Product stack (for orientation only):
+
+```
+Bit Bot / bit-bot-site  →  BitMind (external)  →  OpenBot (this repo)
+                                               computers + CEL + Chromium
+```
+
+| Plane | Repository | This review |
 | --- | --- | --- |
-| Bit Bot iOS / macOS | `bitcloud-labs/bit-bot` | Conversation client. Talks only to BitMind `/v1`. Never OpenBot, AG-UI, TARS, or VNC. |
-| bit-bot-site | `bitcloud-labs/bit-bot-site` | Web / auth / billing face on Contabo. Better Auth + Stripe. Marketing `#computers` / `#bitmind` are illustration, not the plane. |
-| BitMind | `bitcloud-labs/bit-mind` | Durable control plane: identity, workspaces, threads, events, runs, approvals. AG-UI adapter **to** OpenBot. |
-| OpenBot (this repo) | `bitcloud-labs/openbot` | Public fork of `CopilotKit/OpenBot`. Execution plane: CEL gateway, per-bot computers, Chromium, BitMind relay. |
-| OpenBot derivative | `bitcloud-labs/openbot-private` | Private, unforked copy (bit-mind [ADR-0003](https://github.com/bitcloud-labs/bit-mind/blob/main/docs/architecture/decisions/0003-openbot-private-repository.md)). Ahead of this `main` on BitMind computer routes. |
-
-This file assesses **this** checkout (`openbot` `main` @ `ac1b7d1`) and cites siblings where the contract lives. It does not vendor those files.
+| Bit Bot clients | `bitcloud-labs/bit-bot`, `bitcloud-labs/bit-bot-site` | Cited only where they constrain OpenBot (no site→GPU, Contabo is site-only). |
+| BitMind | `bitcloud-labs/bit-mind` | **External caller.** See “How OpenBot expects BitMind.” |
+| OpenBot | **this repo** | **In scope.** |
+| OpenBot derivative | `bitcloud-labs/openbot-private` | Noted where it is ahead of this `main` (computer routes on the BitMind door). |
 
 ---
 
-## Overall score
+## How OpenBot expects BitMind
 
-**~35%** toward “a signed-in Bit Bot / site user can start a real agent that uses a private computer.”
+OpenBot does not embed BitMind. It optionally **mounts a private AG-UI door** that BitMind is supposed to call. Ordinary OpenBot deployments mount nothing (`server/src/bitmind/mount.ts`: any `BITMIND_*` variable means “serve BitMind”; none means no gateway).
+
+What this repo requires of that caller, today:
+
+| Expectation | Where OpenBot enforces it |
+| --- | --- |
+| Service bearer `BITMIND_SERVICE_TOKEN`, timing-safe, on every route except `/health` | `server/src/bitmind/gateway.ts`, [`docs/bitmind-gateway.md`](bitmind-gateway.md) |
+| AG-UI `@ag-ui/core` **0.0.57** — one `POST /bitmind/v1/run` → SSE `text/event-stream` | `server/src/bitmind/config.ts` `AG_UI_PROTOCOL_VERSION`; body = `RunAgentInputSchema` |
+| Identity in `forwardedProps`: `workspace_id`, `agent_id`, `run_id`, `message_id`, `fencing_token` (non-negative int). `run_id` must match `runId`. | `BitmindForwardedPropsSchema` in `gateway.ts`. Forwarded **untouched**; OpenBot does not resolve BitMind users. |
+| `idempotency-key: run_id:fencing_token` while a relay is live → 409 | same |
+| Concurrent relays ≤ `BITMIND_MAX_CONCURRENT_RUNS` (default **2**) → 429 + `retry-after` | `config.ts` |
+| Loopback by default (`BITMIND_GATEWAY_HOST=127.0.0.1`, port **4310**), **not** a path on the published server port | `mount.ts`; boot test asserts `/bitmind/v1/attestation` is 404 on the app port |
+| Honest attestation: `isolated_computers`, `execution.tools`, `execution.interrupts` | `gateway.ts` `BitmindAttestation`. On this `main`, computers/tools/interrupts are all **false**. |
+| No BitMind database URL, OIDC secret, or Docker socket in this process | [`docs/bitmind-gateway.md`](bitmind-gateway.md); `OPENBOT_RUNTIME_MODE=standalone` unmounts Intelligence chat (`server/src/config.ts`) |
+
+What OpenBot does **not** do for BitMind on this `main`:
+
+- Does not mint BitMind sessions, threads, or workspace memberships.
+- Does not verify bit-bot-site Better Auth cookies or JWTs. The door is a **service token**, not a user session.
+- Does not put CEL / audit on the `/bitmind/v1/run` hop. Policy lives on `server/src/computer/gateway.ts` for the OpenBot app path. The BitMind door refuses tools until it attests `tools: true`.
+- Does not serve `/bitmind/v1/computer/{id}` (observe / ensure / screenshot / control). That exists on `openbot-private` and PR [#5](https://github.com/bitcloud-labs/openbot/pull/5). On `main`, those URLs 404.
+- Does not implement `/internal/runs/assert`, `/internal/runs/tools`, or `/internal/roster` (named in BitMind’s service spec as fork work). This tree has `/internal/routines/run` only.
+
+BitMind’s activation note (`docs/operations/openbot-single-host-enclave.md` in that repo) says: do not enable its worker until this gateway attests `isolated_computers=true` plus service auth, fencing idempotency, cancellation, and action audit. OpenBot’s own docs agree the flag must stay false until enclave-managed computers actually stand behind the door.
+
+---
+
+## Overall score (OpenBot side)
+
+**~45%** toward “BitMind can point at this deployment and get a real isolated computer, governed by CEL.”
 
 | Slice | Meaning | Ready |
 | --- | --- | --- |
-| OpenBot laptop / admin product | CEL + Chromium + supervisor, CopilotKit Intelligence threads | **~80%** (alpha, but the machinery exists) |
-| BitMind control plane in isolation | Threads, OIDC identity, durable runs, AG-UI client | **~55%** |
-| Bit Bot → BitMind → OpenBot, prose agent | Auth handoff + enclave + attested relay | **~30%** |
-| Same path, real computer-use | Tools attested, CEL on the BitMind path, TARS optional | **~20%** |
-| Scaled chat (Qwen) + CU-3 customer grant | GPU workers, Redis slots, Stripe computer SKU | **~8%** |
+| OpenBot laptop / admin product | CEL + Chromium + supervisor; Intelligence threads for the web app | **~80%** (alpha, machinery exists) |
+| BitMind door: prose relay | Service auth, `RunAgentInput`, identity props, admission, standalone boot | **~70%** |
+| BitMind door: computers behind it | Attest isolation; ensure / screenshot / control on `/bitmind/v1` | **~25%** on `main` (**~60%** if #5 / `openbot-private` is the deploy source) |
+| BitMind door: governed tool / click | `tools: true` only after CEL+audit sit on that hop | **~10%** |
+| UI-TARS on an OpenBot computer | Vision plugin inside the enclave, not site→GPU | **~5%** (SPEC elsewhere; no code here) |
 
-The 35% headline is the prose-agent slice plus the computer **capability** that already exists on OpenBot and is not yet reachable from Bit Bot.
+The 45% headline is the product computer stack plus a working prose relay, minus computers-on-the-BitMind-door and TARS.
 
 ---
 
 ## Assessment (Done / In progress / Missing)
 
-### 1. BitMind: threads, identity, orchestration, AG-UI boundary — **In progress (~55%)**
+### 1. BitMind caller contract (AG-UI door) — **In progress (~70% as a relay; not a computer plane)**
 
-BitMind is a separate Fastify + PostgreSQL service (`bit-mind` README: “durable, multi-tenant control plane”). It is not under `packages/` here.
+Assessed **as OpenBot implements it**. BitMind’s threads, identity, and worker are out of scope.
 
-| Piece | Status | Evidence |
+| Piece | Status | Evidence in this repo |
 | --- | --- | --- |
-| Threads / conversations / group policy | **Done** (code) | `bit-mind` `src/messaging/` — `repository.ts`, `resources.ts`, `event-catalog.ts`, `group-policy.ts`. Exists because Intelligence threads are one-agent-only ([`docs/architecture.md`](architecture.md) “an Intelligence thread is owned by exactly one agent”; `bit-mind` `docs/architecture/service-specification.md` §1). |
-| Identity | **In progress** | OIDC device flow + JWKS verifier (`src/identity/device-client.ts`, `token-verifier.ts`). Public paths: `/v1/auth/device/start`, `/poll`, `/refresh` (`src/api/authentication.ts`). **Not** Better Auth JWT from bit-bot-site (see §3). |
-| Orchestration / worker | **In progress** | Real `RunWorker` + `OpenBotRunEngine` (`src/worker/main.ts`, `src/runs/openbot-engine.ts`). README still says “Phase 0 scaffold” / “worker intentionally idle” — the code has moved past that. |
-| AG-UI boundary | **In progress** | Rewritten against `@ag-ui/client` `HttpAgent` and `RunAgentInput` (bit-mind [ADR-0002](https://github.com/bitcloud-labs/bit-mind/blob/main/docs/architecture/decisions/0002-openbot-fork-and-ag-ui-pin.md)). Pin **0.0.57**, matching this repo (`server/src/bitmind/config.ts` `AG_UI_PROTOCOL_VERSION`). Identity rides in `forwardedProps` (`workspace_id`, `agent_id`, `run_id`, `message_id`, `fencing_token`) — same schema this gateway validates. |
-| Tools on the BitMind→OpenBot hop | **Missing** | `OpenBotRunEngine.start` always sends `tools: []`. This gateway refuses any run with tools while attestation says `tools: false` (`server/src/bitmind/gateway.ts`). |
-| `/internal/runs/assert`, `/internal/runs/tools`, `/internal/roster` | **Missing** here | Specified in `service-specification.md` §4.2. This tree has `/internal/routines/run` only (`server/src/app.ts`). BitMind is never supposed to sit on the tool path; those internals are still the join for grants and run assertions. |
-
-OpenBot’s own threads (Intelligence) are a **different** store: `server/src/channels/thread-identity.ts` fingerprints CopilotKit thread ids. Standalone / enclave mode unmounts that chat surface (`server/src/config.ts` `OPENBOT_RUNTIME_MODE=standalone`). That is correct for BitMind: BitMind owns the product log; OpenBot in the enclave should not also be Intelligence.
-
-**Blocked on:** bit-mind [#20](https://github.com/bitcloud-labs/bit-mind/issues/20) (enclave) and [#21](https://github.com/bitcloud-labs/bit-mind/issues/21) (wire durable runs; status `blocked`).
+| Optional mount, fail-closed config | **Done** | `server/src/bitmind/mount.ts`, `config.ts` |
+| Service auth + pinned AG-UI 0.0.57 | **Done** | `gateway.ts`, `AG_UI_PROTOCOL_VERSION` |
+| Identity statement on the run | **Done** | `forwardedProps` schema; forwarded, not interpreted |
+| Admission + idempotency + timeout | **Done** (single process) | default 2 runs; 409 / 429 |
+| Standalone (no Intelligence) | **Done** | `OPENBOT_RUNTIME_MODE=standalone`; Helm `charts/openbot/ci/standalone-values.yaml` |
+| Honest “no computers yet” | **Done** | `isolated_computers: false` literal; tests pin it (`server/tests/bitmind-gateway.test.ts`, `standalone-boot.integration.test.ts`) |
+| Computers / tools / interrupts on this door | **Missing** on `main` | [`docs/bitmind-gateway.md`](bitmind-gateway.md) “What it deliberately does not do yet” |
+| `/internal/runs/*` join for grants | **Missing** | Specified as fork work; not in this tree |
 
 ---
 
-### 2. OpenBot: per-bot computers, CEL gateway, Chromium / desktop — **In progress (~70%)**
+### 2. Per-bot computers, CEL gateway, Chromium — **Done on the product path; Missing behind the BitMind door**
 
-Two paths. Do not collapse them.
+Do not collapse the two paths.
 
 #### Product path (OpenBot app → server → computer) — **Done**
 
 | Piece | Evidence |
 | --- | --- |
-| CEL decide-before / audit-after | [`docs/architecture.md`](architecture.md) “Browser action governance”; `server/src/computer/gateway.ts` (resolve snapshot → policy → audit row → act). Fail closed. |
+| CEL decide-before / audit-after | [`docs/architecture.md`](architecture.md); `server/src/computer/gateway.ts`: resolve snapshot → policy → audit row → act. Deny first; empty or broken policy fails closed. Shipped default is `deny: []`, `allow: ["true"]` unless replaced. |
 | Per-bot computers | `COMPUTER_SUPERVISOR_URL` → `server/src/computer/supervisor.ts` (ensure / stop / reset / list). Without it, every Bot shares `AGENT_COMPUTER_URL` ([`docs/deployment.md`](deployment.md)). |
-| Chromium + workspace | `agent-computer` (port 4100). Compose binds loopback. Helm sandbox / StatefulSet for a cluster (`charts/openbot/`). |
+| Chromium + `/workspace` | `agent-computer` (port 4100). Compose binds `127.0.0.1`. Helm sandbox / StatefulSet for a cluster. |
+| Actor type | `ActionActor` on the computer gateway. Product path uses a real `users` row. |
 | Human takeover | `computer.help_requested` / `control_taken` / `control_released`. Bot actions refused while a person drives. |
 | Shared work queue | `work_items` + `select … for update skip locked` (`server/src/work/queue.ts`) for routines, handoffs, computer culler. |
 
-This path is what the OpenBot web app uses. It is **not** what Bit Bot calls.
+This is what `/admin/computers`, `/bot`, and channel screens use. Bit Bot never calls it.
 
 #### BitMind path (this `main`) — **Missing computers behind the door**
 
-On public `main`:
+- Attestation hard-codes `isolated_computers: false`.
+- Relayed agent is prose-only; `tools.length > 0` and `resume` are 400.
+- No `/bitmind/v1/computer/{id}` routes.
 
-- Attestation hard-codes `isolated_computers: false` (`server/src/bitmind/gateway.ts`).
-- Relayed agent is prose-only; tools and resume are refused.
-- No `/bitmind/v1/computer/{id}` routes. BitMind’s `OpenBotComputerGatewayClient` (`bit-mind` `src/computer/gateway-client.ts`) already calls `computer/{id}`, `/ensure`, `/screenshot`, `/control` under the same `/bitmind/v1` root. Those 404 here.
+On **`openbot-private`** and open PR [#5](https://github.com/bitcloud-labs/openbot/pull/5) (`feat/gateway-supervisor-wiring`):
 
-On **`openbot-private`** and open PR [#5](https://github.com/bitcloud-labs/openbot/pull/5) (`feat/gateway-supervisor-wiring` @ `1f2b986`):
-
-- `isolated_computers` is true only while `ComputerGateway.provider.list()` succeeds.
-- Observe / ensure / screenshot / control are served through the **same** `ComputerGateway` the product UI uses (not a second supervisor client).
+- `isolated_computers` is true only while `ComputerGateway.provider.list()` succeeds (same seam as the product UI).
+- Observe / ensure / screenshot / control are served. Control requires `x-bitmind-actor-id` and stamps `bitmind:{id}` — **not** an OpenBot `users` row.
 - Attestation still reports `tools: false` and `interrupts: false`.
 
-So computers exist; the BitMind activation gate on **this** `main` is still honest that they are not behind its door. Merging #5 (or treating `openbot-private` as the deploy source) is the next OpenBot ticket, not a new architecture.
-
-Helm `charts/openbot/ci/standalone-values.yaml` is the enclave shape: `runtimeMode: standalone`, no Intelligence secrets. The chart job matrix in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) does **not** yet include `standalone` (the values file itself says so).
+Merging #5 (or deploying `openbot-private`) is the next **OpenBot** ticket. It does not require a BitMind rewrite.
 
 ---
 
-### 3. Auth handoff from Better Auth / bit-bot-site users — **Missing (~15%)**
-
-Three identity systems, no join.
-
-| System | What it is | Live? |
-| --- | --- | --- |
-| bit-bot-site Better Auth 1.6.30 | Email/password on Contabo. Roles `admin` / `dev` / `customer` on `"user"."role"`. Stripe `metadata.userId` = BA id. | **Yes** (Phase 0). Google/Apple callbacks documented; provider secrets still pending. [`SPEC-auth-production.md`](https://github.com/bitcloud-labs/bit-bot-site/blob/main/docs/SPEC-auth-production.md), `docs/auth-production.md`. |
-| BitMind identity | OIDC device authorization + `OidcTokenVerifier` (RS256/ES256 JWKS). Workspace membership after `/v1/account/bootstrap`. | **Code yes; not BA.** |
-| OpenBot Better Auth | Google / Microsoft / Okta / runtime SAML+OIDC, or `OPENBOT_SINGLE_USER`. Own `users` table. | **Yes** for the OpenBot app. Irrelevant to a site user until actor ids are mapped. |
-
-The computer-use SPEC requires the site to mint a **service JWT to BitMind only** (`sub` = BA user id, `aud` = `bitmind`, `exp` ≤ 120s). BitMind does not verify that JWT today. The service spec’s shared keys are OpenBot `users.id` and `agents.id` — opaque strings BitMind must front, not invent.
-
-There is no implemented path:
-
-```
-bit-bot-site Better Auth session
-    → BitMind workspace principal
-    → OpenBot ActionActor / users.id
-```
-
-Control-transfer on the private gateway stamps `x-bitmind-actor-id` as `bitmind:{id}` and explicitly notes there is **no row in OpenBot `users`**. That is honest and not a handoff.
-
-**P0 for any launch that uses the site as the front door.**
-
----
-
-### 4. Chat workers / Qwen path vs stub — **Missing (~8%)**
+### 3. Auth: what OpenBot will accept from a BitMind hop — **In progress for the service door; user handoff is not OpenBot’s job**
 
 | Layer | Status | Evidence |
 | --- | --- | --- |
-| SPEC + operator roadmap | **Done (docs)** | `bit-bot-site` [`SPEC-bitbot-qwen-scale.md`](https://github.com/bitcloud-labs/bit-bot-site/blob/main/docs/SPEC-bitbot-qwen-scale.md), [`bitbot-qwen-scale.md`](https://github.com/bitcloud-labs/bit-bot-site/blob/main/docs/bitbot-qwen-scale.md). Phases **0–4**. Phase 0 is the SPEC itself. |
-| Production chat / vLLM / gateway | **Missing** | Operator doc: “Chat / GPU: **None.** No `/chat`, no vLLM, no gateway.” `CHAT_ENABLED` must stay unset on Contabo until wired. |
-| Contabo | **Must stay empty** | App limit 256m / 0.5 CPU. vLLM on that box is forbidden. |
-| OpenBot built-in / LangGraph Bots | **Stub relative to Qwen** | `agent-langgraph` / `agent-bot` speak AG-UI and use OpenAI / Anthropic / Google keys — not Qwen3.6-27B, not a gated slot pool. Fine for a lab relay; not the product chat plane. |
-| BitMind `BuiltinRunEngine` | **Stub** | Direct model HTTP when `RUN_ENGINE=builtin`. Not Qwen, not slotted. |
+| OpenBot app sign-in | **Done** | Better Auth: Google / Microsoft / Okta / runtime SAML+OIDC, or `OPENBOT_SINGLE_USER`. Own `users` table. [`README.md`](../README.md) Sign in; `server/src/auth/`. |
+| BitMind **service** door | **Done** | Bearer `BITMIND_SERVICE_TOKEN` only. No cookie, no BA JWT. |
+| Map site / BitMind human → OpenBot `users.id` | **Missing here; belongs to BitMind + site** | This gateway does not verify bit-bot-site sessions. PR #5’s control path treats the BitMind actor as foreign on purpose. |
+| Site Better Auth (Contabo) | **External** | Live email/password is a **bit-bot-site** fact. OpenBot must not grow a second password table or accept `VITE_*` computer URLs. |
 
-Qwen is a **sibling gated plane** to computer-use. Do not load Qwen and TARS in one process or one JWT `aud`.
+OpenBot’s P0 on auth is: keep the BitMind door service-token-only, loopback, and honest about actors that are not local users. The BA → BitMind principal map is the other review.
 
 ---
 
-### 5. UI-TARS / computer-use under OpenBot (not site → GPU) — **Missing (~8%)**
+### 4. Chat workers / Qwen vs what OpenBot actually runs — **OpenBot agents exist; Qwen is not this plane**
 
 | Layer | Status | Evidence |
 | --- | --- | --- |
-| Architecture SPEC | **Done (docs)** | `bit-bot-site` [`SPEC-bitbot-computer-use.md`](https://github.com/bitcloud-labs/bit-bot-site/blob/main/docs/SPEC-bitbot-computer-use.md), [`bitbot-computer-use.md`](https://github.com/bitcloud-labs/bit-bot-site/blob/main/docs/bitbot-computer-use.md). Phases **CU-0 … CU-3**. This PR is CU-0. |
-| Anti-pattern named and refused | **Done (docs)** | `bit-bot-site → TARS → desktop` is out of scope. Sequence must be BitMind session → OpenBot decide-before → TARS on **that** coworker’s sandbox → audit-after. |
-| TARS plugin / weights in OpenBot | **Missing** | No UI-TARS, UI-TARS-2, or vision-plugin registration in this tree or (from searchable names) in `bit-mind`. |
-| Site / Contabo TARS | **Correctly absent** | “Do not put TARS, Chromium, OpenBot, or VNC on the Contabo box.” |
-| CU-1 lab loop | **Missing** | Prove BitMind → decide-before → click → audit-after → destroy. Allowed to start **during** Qwen Phase 1. No site → TARS. |
+| AG-UI Bots in this repo | **Done** (lab) | `agent-bot` (4200), `agent-langgraph` (4201). Default BitMind relay target is `http://localhost:4201/ag-ui`. OpenAI / Anthropic / Google keys — not Qwen3.6-27B, not a vLLM slot pool. |
+| One-container image | **No Bot process** | [`docs/deployment.md`](deployment.md): `MANAGED_AGENT_AG_UI_URL` unset omits the shipped coworker. Enclave must run an agent beside the gateway. |
+| Qwen Phases 0–4 | **Not OpenBot** | Specified on bit-bot-site (`SPEC-bitbot-qwen-scale.md`). Chat GPU must not land in this image or on Contabo. |
 
-TARS **strengthens** OpenBot. It does not replace CEL, Chromium, or BitMind. CU-1 starter model is UI-TARS-1.5-7B; CU-3 target is UI-TARS-2. Chat stays Qwen3.6-27B.
+For an OpenBot-side launch slice, `agent-langgraph` behind the BitMind door is a valid **prose** backend. It is not the product chat plane.
 
 ---
 
-### 6. Multi-user / slots / queue — **In progress (~30%)**
+### 5. UI-TARS / computer-use under OpenBot (not site → GPU) — **Missing**
+
+| Layer | Status | Evidence |
+| --- | --- | --- |
+| Decide-before / audit-after host | **Done** | `server/src/computer/gateway.ts` is the only acting path on the product side. |
+| TARS / UI-TARS-2 / vision plugin | **Missing** | No matches in this tree. |
+| Anti-pattern | **Documented elsewhere; OpenBot must not grow a bypass** | bit-bot-site `SPEC-bitbot-computer-use.md`: `bit-bot-site → TARS → desktop` is refused. Sequence is BitMind session → **this** CEL gateway → TARS on **that** coworker’s computer → audit-after. |
+| CU-1…CU-3 | **External phase names** | Same SPEC. CU-1 is “TARS-1.5-7B as an OpenBot plugin on a lab computer.” That plugin would land **here**, not on Contabo. |
+
+TARS strengthens OpenBot. It does not replace CEL or Chromium. Do not load TARS and Qwen in one process.
+
+---
+
+### 6. Multi-user / slots / queue — **In progress**
 
 | Mechanism | Status | Evidence |
 | --- | --- | --- |
-| BitMind gateway admission | **Done (single process)** | In-memory `Map` of live relays. Ceiling `BITMIND_MAX_CONCURRENT_RUNS` default **2**, 429 + `retry-after` (`server/src/bitmind/gateway.ts`, `config.ts`). Matches the enclave note (two concurrent computers). |
-| OpenBot `work_items` | **Done** | Postgres claim/lease for routines, handoffs, culler. Multi-replica safe. |
-| Product slots (`COMPUTER_MAX_SLOTS`, `COMPUTER_QUEUE_MAX`, 503 `queue_full`) | **Missing** | Specified on the OpenBot / BitMind worker, not Contabo (`bitbot-computer-use.md`). No Redis semaphore in this repo. |
-| Chat slots (`CHAT_QUEUE_MAX` = vLLM `--max-num-seqs`) | **Missing** | Qwen SPEC. |
-| Multi-replica gateway admission | **Missing** | The live-run `Map` is process-local. Two replicas double the ceiling. The PR template (`.github/pull_request_template.md`) already forbids this class of state. |
+| BitMind-door admission | **Done (one process)** | In-memory `Map`; `BITMIND_MAX_CONCURRENT_RUNS` default 2; 429. Matches the enclave “two computers” ceiling. |
+| Product `work_items` | **Done** | Multi-replica safe (`server/src/work/queue.ts`). |
+| `COMPUTER_MAX_SLOTS` / `COMPUTER_QUEUE_MAX` / 503 `queue_full` | **Missing** | Named on the computer-use SPEC for this plane (or BitMind’s worker). Not implemented here. |
+| Multi-replica BitMind-door admission | **Missing** | The live-run `Map` is process-local. Two replicas double the ceiling. `.github/pull_request_template.md` already forbids that class of state. |
 
-A full pool **must** 503 `queue_full`. An OOM kill is a missed gate.
-
----
-
-### 7. Deploy topology vs Contabo Tier-1 site-only — **In progress (~25%)**
-
-**What is live (do not re-do):**
-
-```
-Browser → bit-bot-site + Postgres 17   (Contabo VPS, 256m / 0.5 CPU)
-          Better Auth email/password, RBAC, Stripe seats
-          No BitMind, no OpenBot, no Qwen, no TARS, no Chromium
-```
-
-**What the SPECs require:**
-
-```
-Browser → Tier 1 site (Contabo: auth + billing + optional BitMind BFF)
-                │  service JWT to BitMind only
-                ▼
-           BitMind
-        ┌────────┴────────┐
-        ▼                 ▼
-  Chat: Qwen GPU     Computer: OpenBot enclave
-  (RunPod etc.)      (not Contabo; loopback / private)
-        │                 │
-        │                 ▼
-        │            CEL → per-bot Chromium
-        │            TARS plugin (CU-1+)
-```
-
-| Target | Status |
-| --- | --- |
-| Contabo stays site-only | **Done** as policy and as current deploy |
-| BitMind staging / production host | **In progress** (compose + ops docs; not the launch join) |
-| OpenBot single-host enclave | **Specified, not activated** — `bit-mind` [`docs/operations/openbot-single-host-enclave.md`](https://github.com/bitcloud-labs/bit-mind/blob/main/docs/operations/openbot-single-host-enclave.md). Rootless `openbot-exec`, no BitMind DB URL, loopback gateway, start at two computers. Activation gate: `isolated_computers=true` **plus** service auth, fencing idempotency, cancellation, action audit. A failed attestation leaves jobs queued; BitMind never falls back to local execution. Issue [#20](https://github.com/bitcloud-labs/bit-mind/issues/20) still open. |
-| OpenBot one-container image | **Done** as an artefact ([`docs/deployment.md`](deployment.md)). **No supervisor** in the image → shared browser. Not a tenant boundary. Not the enclave. |
-| Helm cluster (per-bot sandbox computers) | **Done** as templates; not the Contabo topology. |
-| `openbot-private` vs this `main` | **Split.** ADR-0003: deploy the private derivative; keep this public fork. Private is ahead on BitMind computer routes (commits after `ac1b7d1`). Public PR #5 is that delta, unmerged. |
+A full pool must refuse (429/503). An OOM kill is a missed gate. Chromium sizing: [`docs/deployment.md`](deployment.md) ~1 GB per concurrent browser; image floor 2 GB / recommended 4 GB.
 
 ---
 
-### 8. Tests / CI / SPECs that define remaining phases — **In progress (~60%)**
+### 7. Deploy topology vs Contabo Tier-1 site-only — **In progress**
 
-#### Phase map (cite these; do not renumber)
+**Contabo is not an OpenBot host.** bit-bot-site runs there (256m / 0.5 CPU). Chromium, the supervisor, TARS, and vLLM must not.
 
-**Auth → chat workers → computer-use** is defined on **bit-bot-site**, not here.
-
-| Phase | Ship | Repo |
+| OpenBot deploy shape | Status | Fit for BitMind |
 | --- | --- | --- |
-| Auth 0 | Better Auth email/password live on Contabo | `SPEC-auth-production.md` — **done, do not re-do** |
-| Auth 1–2 | Email/password harden + Google/Apple + RBAC | Same SPEC — **in progress / secrets pending** |
-| Email OTP | Postmark OTP + orbit UI | `SPEC-email-otp.md`, `SPEC-email-otp-orbit.md` |
-| Qwen 0 | Chat SPEC | `SPEC-bitbot-qwen-scale.md` — **this is the current chat phase** |
-| Qwen 1 | One GPU worker + gateway + Redis; prove 503 before OOM; site `CHAT_ENABLED=false` | same |
-| Qwen 2 | `/chat` UI | same |
-| Qwen 3 | Autoscale from queue depth | same |
-| Qwen 4 | Stripe monthly token allowance | same |
-| CU-0 | Computer-use SPEC | `SPEC-bitbot-computer-use.md` |
-| CU-1 | TARS-1.5-7B as OpenBot plugin on a **lab** computer | same — may overlap Qwen 1 |
-| CU-2 | Site viewer via BitMind BFF (`admin`/`dev`) | after chat SSE **or** watchable computer events |
-| CU-3 | UI-TARS-2 + customer Stripe grant | weights stay on OpenBot |
+| Laptop compose (`scripts/start.sh`) | **Done** | Shared or per-bot computers; Intelligence required unless standalone. |
+| One-container image | **Done** as artefact | **No supervisor** → one shared browser. Not a tenant boundary. Not the enclave. |
+| Helm (EKS / GKE / AKS / self-hosted / sandbox) | **Done** as templates | Per-bot computers when `computers.mode: sandbox`. Chart CI does **not** yet render `standalone` (the values file says to add it). |
+| Standalone + BitMind door (enclave) | **Code done; host not this review** | `OPENBOT_RUNTIME_MODE=standalone` + `BITMIND_*`. Loopback gateway. BitMind’s #20 is the **external** host/rootless-Docker ticket. |
+| `openbot-private` vs this `main` | **Split** | Private is ahead on BitMind computer routes (after `ac1b7d1`). Public PR #5 is that delta, unmerged. |
 
-**BitMind delivery plan** (`docs/architecture/delivery-plan.md`):
+OpenBot must not hold BitMind DB URLs or OIDC secrets. The enclave note in the BitMind repo is the **caller’s** activation gate; this repo’s job is to attest honestly and bind loopback.
 
-| Phase | Exit |
+---
+
+### 8. Tests / CI / SPECs that define remaining phases — **In progress**
+
+**This repo CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): format / lint / types; `agent-computer` + `supervisor` typecheck; Helm render + refusals; Postgres integration tests; migration drift; image boot (PRs need `full-ci`). BitMind-door tests pin `isolated_computers: false` and the second-port rule.
+
+**Phase map (sibling SPECs — cite, do not renumber; not implemented here):**
+
+| Phase | What it asks of **OpenBot** |
 | --- | --- |
-| 0 Executable contract | Clean checkout builds; API/worker + Postgres — largely **done** |
-| 1 Identity + messaging | BitBot authenticates to staging; direct/group/thread/reconnect — **in progress** (OIDC, not site BA) |
-| 2 Agent runs | Persisted message → resumable run; no AG-UI types on iOS — **blocked** on #20/#21 |
-| 3 Safety + collaboration | Approvals, policy, takeover — **in progress** in code, not joined |
-| 4 Product completion | Search, memories, routines, APNs, retention — **later** |
+| Auth 0–2 (bit-bot-site `SPEC-auth-production`) | Nothing on this door. Do not become the site IdP. |
+| Qwen 0–4 (`SPEC-bitbot-qwen-scale`) | Do not run vLLM. Keep AG-UI Bots as the enclave prose backend until Qwen exists elsewhere. |
+| CU-0 (`SPEC-bitbot-computer-use`) | Docs only today. |
+| CU-1 | TARS plugin **on this computer**, behind CEL. No site→TARS. May overlap Qwen 1. |
+| CU-2 | Frames/status BitMind can project; OpenBot remains the ledger. |
+| CU-3 | UI-TARS-2 weights stay **on OpenBot**. |
 
-**This repo CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): format/lint/types, `agent-computer` + `supervisor` typecheck, Helm render + refusals (self-hosted / EKS / GKE / AKS), Postgres integration tests, migrations drift, image boot (PRs need `full-ci`). BitMind gateway unit + standalone boot tests: `server/tests/bitmind-gateway.test.ts`, `standalone-boot.integration.test.ts` (asserts `isolated_computers: false` and that `/bitmind/v1` is **not** on the public server port).
-
-There was **no** launch-readiness document in this tree before this file.
+There was no launch-readiness document in this tree before this file.
 
 ---
 
-## Dependency map
+## Dependency map (OpenBot-centric)
 
 ```
-bit-bot-site Better Auth (live)
-        │  P0: service JWT / principal map
+BitMind (EXTERNAL — other review)
+        │  Bearer BITMIND_SERVICE_TOKEN
+        │  POST /bitmind/v1/run   (AG-UI 0.0.57 + forwardedProps)
+        │  GET  /bitmind/v1/attestation
         ▼
-   BitMind identity + workspace
+OpenBot BitMind door   (loopback :4310, this process)
         │
-        ├─ threads / events          (code exists)
-        ├─ RunWorker + HttpAgent     (code exists; tools:[])
-        │        │
-        │        ▼
-        │   OpenBot BitMind gateway  (this main: prose relay)
-        │        │
-        │        ├─ #5 / openbot-private: isolated_computers from ComputerGateway
-        │        ├─ P0: tools + interrupts attestation when CEL path is live
-        │        └─ P0: bit-mind #20 rootless enclave (not Contabo)
-        │                 │
-        │                 ▼
-        │            supervisor → agent-computer (CEL already here)
-        │                 │
-        │                 └─ CU-1: TARS plugin on that computer (not site→GPU)
+        ├─ this main: prose relay → BITMIND_AGENT_URL (agent-langgraph)
+        │         isolated_computers: false
+        │         tools / interrupts refused
         │
-        └─ Qwen 1–4: chat GPU plane (not Contabo; not TARS)
+        ├─ #5 / openbot-private:
+        │         ComputerGateway.list() → isolated_computers
+        │         /bitmind/v1/computer/{id}  ensure | screenshot | control
+        │
+        └─ product CEL path (already here, not on the BitMind door yet)
+                  supervisor → agent-computer (Chromium + /workspace)
+                  decide-before → audit-after
+                  CU-1 later: TARS plugin on THAT computer
 ```
 
-Hard rules already written down (do not “simplify” them at launch):
+Hard rules (already written; do not “simplify” at launch):
 
-1. Bit Bot / the browser never see an OpenBot, AG-UI, TARS, VNC, or GPU URL.
-2. BitMind never executes browser/file/shell/MCP locally.
-3. OpenBot never holds BitMind DB URLs, OIDC secrets, or the root Docker socket.
-4. Contabo never runs OpenBot, Chromium, vLLM, or TARS.
-5. Qwen and TARS never share a process or a slot pool.
-
----
-
-## P0 / P1
-
-### P0 — without these, do not advertise real agents or computers
-
-1. **Choose the OpenBot deploy source and land computer attestation.** Merge public PR #5 or ship from `openbot-private`, so `isolated_computers` can become true when a supervisor actually answers. Do not flip the flag by hand.
-2. **Stand up the enclave (bit-mind #20).** Rootless account, loopback gateway, two-computer ceiling, no BitMind secrets in the enclave. Until attestation passes, keep the BitMind worker from treating OpenBot as live computers.
-3. **Auth handoff.** bit-bot-site BA user id → BitMind principal/workspace → opaque OpenBot actor. One mapping, tested both ways. Google/Apple on the site can wait; email/password is already live.
-4. **Do not enable tools on the BitMind hop until CEL + audit are on that hop.** Today `tools: false` is load-bearing. Turning it on without the product gateway in the path would be the site→GPU class of bug, just one layer down.
-5. **Keep Contabo site-only.** Kill switches: `CHAT_ENABLED=false`, `COMPUTER_USE_ENABLED=false`. Never `docker compose down -v` on Contabo (`bitbot-pgdata`).
-
-### P1 — needed for a launch people will pay for, not for a first honest agent
-
-1. Qwen Phase 1: one worker + Redis slots; prove 503 `queue_full` before OOM; site flag off until then.
-2. CU-1 lab: TARS-1.5-7B as an OpenBot plugin; BitMind → decide-before → click → audit → destroy.
-3. Durable gateway admission (not an in-process `Map`) if more than one OpenBot replica exists.
-4. `GET /internal/runs/tools` + run-assertion mint so BitMind can offer granted tools without sitting on the tool path (`service-specification.md` §4.2).
-5. AG-UI interrupt / resume so BitMind approvals are not racing `TOOL_CALL_START` (ADR-0002 follow-up; this gateway still attests `interrupts: false`).
-6. Helm CI matrix includes `standalone`; pin `@ag-ui/*` 0.0.57 on both sides when either moves.
-7. bit-mind #21 acceptance (one persisted message → one run; reconnect; cancel; approval pause) before calling the join “done.”
-8. Site Google/Apple secrets and CU-3 Stripe `computer_use` grant — after CU-2 works for `admin`/`dev`.
-
-### Not P0
-
-- UI-TARS-2 weights, Qwen autoscale, Stripe token meters, watch companion polish, ACS/Codex R&D (bit-mind #95–#113).
-- Re-doing Auth Phase 0 or putting Intelligence back into the enclave.
+1. The BitMind door stays off the published app port.
+2. `isolated_computers` is true only when a computer provider is actually answering.
+3. `tools: true` only after acting calls hit `server/src/computer/gateway.ts`.
+4. No BitMind secrets, Docker socket, or site→TARS/VNC URL in this process.
+5. Contabo never runs this image as the computer plane.
 
 ---
 
-## Minimum launch slice
+## P0 / P1 (OpenBot tickets)
 
-Ship **one** honest vertical, then stop.
+### P0 — without these, BitMind cannot honestly enable computers
 
-**Slice ML-1 — “signed-in person, one prose coworker, private computer visible, no TARS, no Qwen GPU.”**
+1. **Land computers on the BitMind door.** Merge PR #5 or ship `openbot-private` so attestation can become true when the supervisor answers. Do not flip the flag by hand.
+2. **Keep `tools: false` until one governed click uses `ComputerGateway`.** Turning tools on while the relay is prose-only would bypass CEL.
+3. **Enclave bind + standalone.** Loopback (or private) gateway, `OPENBOT_RUNTIME_MODE=standalone`, no Intelligence contract, no BitMind credentials in this process. Host/rootless-Docker is BitMind #20 (external).
+4. **Do not put OpenBot on Contabo.** Kill switch is “unset `BITMIND_*` / don’t schedule this image there,” not a site flag.
 
-1. Contabo remains the auth/billing face. Email/password is enough.
-2. BitMind accepts that user (BA JWT **or** a short-lived exchange onto today’s OIDC principal — pick one, document it, test it).
-3. OpenBot runs **standalone** in the enclave (`OPENBOT_RUNTIME_MODE=standalone`), gateway on loopback, supervisor + one `agent-computer` per coworker, CEL on.
-4. Land #5 / `openbot-private` computer routes. Attestation may say `isolated_computers: true` only while the supervisor answers.
-5. First agent is the existing LangGraph (or built-in) AG-UI endpoint behind the relay. Prose is enough. **Leave `tools: false` until a single governed click is proven on this hop.**
-6. BitMind run: user message → worker lease → `HttpAgent` POST `/bitmind/v1/run` → SSE normalized into the BitMind event log → client.
-7. Computer: ensure + screenshot + take/release via BitMind `/v1` (opaque ids). Human takeover uses the existing OpenBot control verbs. No live CDP pipe required (bit-bot#58 baseline is a snapshot).
-8. Caps: `BITMIND_MAX_CONCURRENT_RUNS=2`, one computer per coworker, destroy on stop/TTL. 429/503 when full.
-9. **Out of ML-1:** Qwen workers, TARS, customer `computer_use`, site `/chat` UI, Intelligence, shared Contabo desktop.
+### P1 — OpenBot follow-through after the door has computers
 
-**Exit for ML-1:** a staging user who signed in on the site (or Bit Bot device) sees a thread, gets a streamed prose reply from a real AG-UI agent, can open that coworker’s screenshot, and every computer act that *is* allowed has an OpenBot audit row. Isolation attestation is true. Tools that are not attested cannot be sent.
+1. CU-1: TARS-1.5-7B as a plugin/sidecar **inside** a per-bot computer. Screenshot in, closed verbs out, CEL still in front.
+2. Attest `tools: true` / `interrupts: true` only after those paths are real (`agent-langgraph` HITL is not there yet — [`docs/bitmind-gateway.md`](bitmind-gateway.md)).
+3. Durable admission if a second replica serves `/bitmind/v1` (replace the in-process `Map`).
+4. `/internal/runs/tools` + run-assertion mint if BitMind still needs grant catalogues without sitting on the tool path.
+5. Add `standalone` to the Helm CI matrix.
+6. `COMPUTER_MAX_SLOTS` / 503 `queue_full` on this plane (not Contabo).
+7. Pin `@ag-ui/*` 0.0.57 until BitMind’s pin moves.
 
-**Then:**
+### Not this repo
 
-- **ML-2** = Qwen Phase 1 (chat GPU, still no Contabo GPU) in parallel with **CU-1** (TARS on the same OpenBot computer, still no site→TARS).
-- **ML-3** = `tools: true` on the BitMind hop **after** CEL+audit are proven for a click that originated from that hop; then CU-2 site viewer for `admin`/`dev`.
-
-Anything that advertises “own computer” or “workforce” on the marketing face before ML-1 exits is selling the illustration in `bit-bot-site` `computers.tsx`.
+- BitMind threads, OIDC, worker leases, BA JWT exchange, Qwen GPU, Stripe grants, site `/chat` UI.
+- Re-doing bit-bot-site Auth Phase 0.
 
 ---
 
-## What this repo should do next (OpenBot-only)
+## Minimum launch slice (what OpenBot must present)
 
-These are the tickets that belong **here** (or on `openbot-private`), not on the site:
+**ML-1 — OpenBot enclave BitMind can point at:** standalone server, loopback BitMind door, supervisor + one Chromium per coworker, CEL on the product gateway, `#5` computer routes, `isolated_computers` derived from reachability, `tools: false`, `BITMIND_MAX_CONCURRENT_RUNS=2`, LangGraph (or equivalent) as the prose agent. Screenshot + take/release are enough; no CDP pipe, no TARS, no Qwen.
 
-1. Merge or re-apply PR #5 so public `main` matches the computer surface BitMind already calls.
-2. Add `standalone` to the Helm CI matrix (values file already asks for it).
-3. When tools are ready: attest `tools: true` only after the relayed agent’s tool callbacks hit `server/src/computer/gateway.ts`, not a side door.
-4. Replace the in-process admission `Map` before a second replica.
-5. Keep this document updated when #5 / #20 / the BA handoff land — or supersede it.
+**Exit:** BitMind (external) can authenticate, start one prose run, ensure a computer, fetch a screenshot, and read an attestation that is true only while that supervisor is up. Every acting computer verb that exists still goes through CEL + audit. Tools that are not attested cannot be sent.
+
+**Then ML-2 (OpenBot):** CU-1 TARS on that same computer. **ML-3:** `tools: true` after a click that originated on the BitMind hop is decide-before / audit-after proven.
 
 ---
 
@@ -349,8 +289,4 @@ These are the tickets that belong **here** (or on `openbot-private`), not on the
 
 **This repo:** [`docs/bitmind-gateway.md`](bitmind-gateway.md), [`docs/architecture.md`](architecture.md), [`docs/deployment.md`](deployment.md), `server/src/bitmind/{gateway,config,mount}.ts`, `server/src/computer/{gateway,supervisor}.ts`, `server/src/work/queue.ts`, `server/src/config.ts`, `.github/workflows/ci.yml`, `charts/openbot/ci/standalone-values.yaml`, PRs #1–#5.
 
-**bit-mind:** README, `docs/architecture/{README,delivery-plan,service-specification}.md`, ADR-0002, ADR-0003, `docs/operations/openbot-single-host-enclave.md`, `src/runs/openbot-engine.ts`, `src/computer/gateway-client.ts`, `src/identity/token-verifier.ts`, `src/api/authentication.ts`, issues #20, #21.
-
-**bit-bot-site:** `SPEC-auth-production.md`, `SPEC-bitbot-qwen-scale.md`, `SPEC-bitbot-computer-use.md`, operator summaries `bitbot-qwen-scale.md` / `bitbot-computer-use.md`.
-
-**openbot-private:** `server/src/bitmind/gateway.ts` @ `1f2b986` (computer routes + derived `isolated_computers`).
+**External (contract citations only):** `bitcloud-labs/bit-mind` ADR-0002 / `openbot-single-host-enclave.md`; `bitcloud-labs/bit-bot-site` `SPEC-bitbot-qwen-scale.md`, `SPEC-bitbot-computer-use.md`; `bitcloud-labs/openbot-private` `server/src/bitmind/gateway.ts` @ `1f2b986`.
